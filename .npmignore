@@ -1,0 +1,5 @@
+scripts
+docs
+.DS_Store
+.env*
+*.tgz

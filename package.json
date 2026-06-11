@@ -1,0 +1,35 @@
+{
+  "name": "oases-ocli",
+  "version": "0.1.0",
+  "description": "Local desktop runtime for Oases Chat project mode.",
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/ocli-smoke.mjs && node scripts/ocli-package-smoke.mjs",
+    "test:smoke": "node scripts/ocli-smoke.mjs",
+    "test:package": "node scripts/ocli-package-smoke.mjs"
+  },
+  "bin": {
+    "ocli": "./bin/ocli.js",
+    "oases-ocli": "./bin/ocli.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "oases",
+    "cli",
+    "agent",
+    "desktop",
+    "runtime"
+  ],
+  "license": "UNLICENSED",
+  "private": false
+}
