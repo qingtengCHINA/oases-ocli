@@ -45,13 +45,25 @@ const OASES_MASK = [
 const OASES_WIDTH = Math.max(...OASES_MASK.map((row) => row.length));
 const OASES_HEIGHT = OASES_MASK.length;
 
-function supportsInteractiveUi(stream = process.stdout) {
+function isExplicitAnsiWindowsTerminal(env = process.env) {
+  return Boolean(
+    env.WT_SESSION ||
+      env.TERM_PROGRAM ||
+      env.ANSICON ||
+      env.ConEmuANSI === "ON" ||
+      /^(xterm|vt100|vt220|screen|tmux|rxvt)/i.test(env.TERM || ""),
+  );
+}
+
+export function supportsInteractiveUi(stream = process.stdout, env = process.env, platform = process.platform) {
+  if (env.OCLI_ANIMATED_UI === "1") return Boolean(stream.isTTY && env.CI !== "true" && env.TERM !== "dumb");
+  if (platform === "win32" && !isExplicitAnsiWindowsTerminal(env)) return false;
   return Boolean(
     stream.isTTY &&
-      process.env.CI !== "true" &&
-      process.env.TERM !== "dumb" &&
-      process.env.NO_COLOR === undefined &&
-      process.env.OCLI_PLAIN_UI !== "1",
+      env.CI !== "true" &&
+      env.TERM !== "dumb" &&
+      env.NO_COLOR === undefined &&
+      env.OCLI_PLAIN_UI !== "1",
   );
 }
 
@@ -177,6 +189,7 @@ function plainStartupLog({ port, workspace, token, version, runtimeSource }) {
   console.log(`ocli ${version} (${runtimeSource}) listening on http://127.0.0.1:${port}`);
   console.log(`workspace: ${workspace}`);
   if (token) console.log(`token: ${token}`);
+  console.log("正在运行ocli，请打开https://www.oasesai.xyz 选择“工程模式”配合使用");
 }
 
 function renderStatus({ frame, port, workspace, token, version, runtimeSource }) {
@@ -198,7 +211,12 @@ function renderStatus({ frame, port, workspace, token, version, runtimeSource })
 export function startTerminalStatusUi(options) {
   if (!supportsInteractiveUi()) {
     plainStartupLog(options);
-    return { stop() {} };
+    const openTimer = process.stdout.isTTY && process.env.CI !== "true" ? setTimeout(openOasesWeb, 6000) : undefined;
+    return {
+      stop() {
+        if (openTimer) clearTimeout(openTimer);
+      },
+    };
   }
 
   let frame = 0;

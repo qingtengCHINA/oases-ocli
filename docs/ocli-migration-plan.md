@@ -53,7 +53,8 @@ The end state is:
 | 21. Standalone CLI push folder | Done | Give the user a clean folder that can be pushed as a separate GitHub/npm package source | `oases-ocli/` with package manifest, bin, runtime source, standalone smoke tests, docs, ignore files; README push guidance | `cd oases-ocli && npm test`, root `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` | Local docs/package structure only |
 | 22. Zero-argument CLI startup | Done | Make the published terminal experience start with `ocli` instead of `ocli serve --workspace .` | CLI parser defaults to `serve`, help/docs promote `ocli`, package smoke covers zero-arg and leading-flag forms | `cd oases-ocli && npm test`, root `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Local CLI UX only |
 | 24. Workspace absolute paths and oases prompt | Done | Fix Web/CLI disagreement where `/Users/qingteng/Downloads` was wrongly treated as outside `workspace: /Users/qingteng` | `workspaceRelativePath`, file tool absolute-path normalization, Web project prompt from `oasesprompt.md`, Web pre-validation bypass for connected ocli, `0.1.1` package bump | `pnpm test:ocli`, `pnpm test:ocli-package`, `cd oases-ocli && npm test`, `pnpm build`, npm registry/local install checks passed | Published `oases-ocli@0.1.1`; Web production deployed |
-| 25. Self-update command | In progress | Let users upgrade with `ocli update` or `ocli upgrade` instead of remembering npm syntax | CLI parser aliases, `src/updater.js`, entrypoint wiring, help/docs, package smoke dry-run coverage, `0.1.2` package bump | `pnpm test:ocli-package` and `cd oases-ocli && npm test` passed | npm publish waiting for npm 2FA OTP |
+| 25. Self-update command | Done | Let users upgrade with `ocli update` or `ocli upgrade` instead of remembering npm syntax | CLI parser aliases, `src/updater.js`, entrypoint wiring, help/docs, package smoke dry-run coverage, `0.1.2` package bump | `pnpm test:ocli-package` and `cd oases-ocli && npm test` passed | Published by user |
+| 26. Windows terminal compatibility | Ready to publish | Stop animated terminal UI from repeatedly refreshing legacy Windows cmd windows | Terminal capability detection, Windows cmd static fallback, Windows Terminal/VS Code animation allowlist, `OCLI_ANIMATED_UI=1` override, `0.1.3` package bump | `node --check`, `pnpm test:ocli-package`, `pnpm test:ocli`, and `cd oases-ocli && npm test` passed | npm publish waiting for browser OTP/auth |
 
 ## Phase 1 Detailed Checklist
 
@@ -142,7 +143,8 @@ The end state is:
 | 7.6 GitHub validation workflow | Done | `.github/workflows/ocli-ci.yml`, `oases-ocli/.github/workflows/ci.yml` | Added monorepo CI for Web-integrated validation and standalone CLI CI for `npm test` plus `npm pack --dry-run`. npm publish workflow remains pending until license/npm token policy is confirmed. |
 | 7.7 Real npm publish | Done | npm | Published `oases-ocli@0.1.0` from `oases-ocli/` under npm account `qingtengpro`; verified `npm view oases-ocli` and clean global-prefix install with `npm install -g oases-ocli`. |
 | 7.8 npm patch release | Done | npm, `oases-ocli/package.json` | Published `oases-ocli@0.1.1`; `npm view oases-ocli version dist-tags bin --json` reports latest `0.1.1`, and local global upgrade now prints `ocli 0.1.1`. |
-| 7.9 npm self-update release | In progress | npm, `oases-ocli/package.json` | `oases-ocli@0.1.2` adds `ocli update` and `ocli upgrade`; local package validation passed, npm publish is waiting for 2FA OTP. |
+| 7.9 npm self-update release | Done | npm, `oases-ocli/package.json` | `oases-ocli@0.1.2` adds `ocli update` and `ocli upgrade`; user completed the npm publish. |
+| 7.10 Windows cmd patch release | Ready to publish | npm, `oases-ocli/package.json`, `src/terminalUi.js` | `oases-ocli@0.1.3` prevents legacy Windows `cmd.exe` from running the animated full-screen terminal renderer; package validation passed and `npm publish --access public` returned EOTP pending browser OTP/auth. |
 
 ## Phase 8 Terminal UX Checklist
 
@@ -383,6 +385,7 @@ The end state is:
 | 2026-06-11 21:39 | Phase 7.7 completed: published `oases-ocli@0.1.0` to the npm registry and restored Web/docs install guidance to `npm install -g oases-ocli`. | `cd oases-ocli && npm test`, `pnpm test:ocli-package`, `pnpm build`, `npm view oases-ocli`, and clean temp-prefix `npm install -g oases-ocli && ocli --help` passed. Build still has known CSS minify/chunk warnings. | npm package published; Web production already shows the registry install command. |
 | 2026-06-11 22:10 | Phase 24 completed: workspace-internal absolute paths are accepted and normalized, Web project prompt now carries oases identity/path rules, and frontend pre-validation no longer blocks connected ocli absolute paths. | `pnpm test:ocli`, `pnpm test:ocli-package`, `cd oases-ocli && npm test`, `pnpm build`, `npm view oases-ocli`, and local `npm install -g oases-ocli@latest && ocli --help` passed. | Published `oases-ocli@0.1.1`; production deployed: `https://oases-chat-km60bnpyk-qingtengs-projects.vercel.app`; aliased to `https://www.oasesai.xyz`; inspect: `https://vercel.com/qingtengs-projects/oases-chat/AndJZaXQsPF7hXtWqhk78stQTP6w`. |
 | 2026-06-11 22:46 | Phase 25 started: added `ocli update` and `ocli upgrade` self-update aliases that run `npm install -g oases-ocli@latest`. | `node --check`, `pnpm test:ocli-package`, and `cd oases-ocli && npm test` passed. `npm publish --access public` prepared `oases-ocli@0.1.2` tarball but npm returned EOTP. | Waiting for npm 2FA OTP to publish `0.1.2`. |
+| 2026-06-12 00:06 | Phase 26 ready: fixed Windows legacy cmd refresh bug by disabling animated full-screen redraw outside explicit ANSI-capable Windows terminals, while keeping Windows Terminal/VS Code animation and adding `OCLI_ANIMATED_UI=1` force mode. | `node --check ocli/src/terminalUi.js`, `node --check oases-ocli/src/terminalUi.js`, `pnpm test:ocli-package`, `pnpm test:ocli`, and `cd oases-ocli && npm test` passed. | Prepared `oases-ocli@0.1.3`; `npm publish --access public` reached publish step but returned EOTP. |
 
 ## Latest Known Good Validation
 
@@ -397,8 +400,8 @@ Latest production deployment:
 
 ```text
 https://www.oasesai.xyz
-https://oases-chat-km60bnpyk-qingtengs-projects.vercel.app
-Inspect: https://vercel.com/qingtengs-projects/oases-chat/AndJZaXQsPF7hXtWqhk78stQTP6w
+https://oases-chat-7de1ca84u-qingtengs-projects.vercel.app
+Inspect: https://vercel.com/qingtengs-projects/oases-chat/7DJ9t8gpPjYjitL9rPK4nVRi6iZh
 ```
 
 Latest preview deployment:

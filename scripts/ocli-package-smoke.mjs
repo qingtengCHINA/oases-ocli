@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "../src/cli.js";
+import { supportsInteractiveUi } from "../src/terminalUi.js";
 
 const packageRoot = path.resolve(import.meta.dirname, "..");
 
@@ -45,8 +46,16 @@ assert(manifest.bugs?.url === "https://github.com/qingtengCHINA/oases-ocli/issue
 assert(manifest.homepage === "https://github.com/qingtengCHINA/oases-ocli#readme", "package should expose the GitHub README homepage");
 assert(manifest.license === "Apache-2.0", "package should use Apache-2.0 license");
 
+const ttyStream = { isTTY: true };
+assert(!supportsInteractiveUi(ttyStream, {}, "win32"), "Windows cmd should use static terminal UI by default");
+assert(supportsInteractiveUi(ttyStream, { WT_SESSION: "1" }, "win32"), "Windows Terminal should keep animated terminal UI");
+assert(supportsInteractiveUi(ttyStream, { TERM_PROGRAM: "vscode" }, "win32"), "VS Code terminal on Windows should keep animated terminal UI");
+assert(supportsInteractiveUi(ttyStream, { OCLI_ANIMATED_UI: "1" }, "win32"), "users should be able to force animated terminal UI");
+assert(!supportsInteractiveUi(ttyStream, { OCLI_PLAIN_UI: "1" }, "darwin"), "plain UI env should disable animation");
+assert(!supportsInteractiveUi({ isTTY: false }, { WT_SESSION: "1" }, "win32"), "non-TTY output should never animate");
+
 const help = await run(process.execPath, ["bin/ocli.js", "--help"]);
-assert(help.stdout.includes("ocli 0.1.2"), "packaged CLI should print help");
+assert(help.stdout.includes("ocli 0.1.3"), "packaged CLI should print help");
 assert(help.stdout.includes("\n  ocli\n"), "packaged CLI help should include zero-argument startup");
 assert(help.stdout.includes("ocli --workspace ~/Projects/my-app"), "packaged CLI help should include short workspace example");
 assert(help.stdout.includes("ocli update"), "packaged CLI help should include self-update command");
@@ -91,7 +100,7 @@ try {
   await run("npm", ["init", "-y"], installRoot);
   await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], installRoot);
   const installedHelp = await run(process.platform === "win32" ? "node_modules\\.bin\\oases-ocli.cmd" : "node_modules/.bin/oases-ocli", ["--help"], installRoot);
-  assert(installedHelp.stdout.includes("ocli 0.1.2"), "installed tarball should expose the oases-ocli binary");
+  assert(installedHelp.stdout.includes("ocli 0.1.3"), "installed tarball should expose the oases-ocli binary");
   assert(installedHelp.stdout.includes("\n  ocli\n"), "installed tarball help should include zero-argument startup");
   const installedUpdateDryRun = await run(process.platform === "win32" ? "node_modules\\.bin\\ocli.cmd" : "node_modules/.bin/ocli", ["upgrade", "--dry-run"], installRoot);
   assert(installedUpdateDryRun.stdout.includes("npm install -g oases-ocli@latest"), "installed tarball should expose update/upgrade dry-run");

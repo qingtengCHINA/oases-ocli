@@ -82,14 +82,14 @@ Keep `oases-ocli@latest` installed. Starting with `0.1.1`, filesystem tools acce
 
 Common npm commands:
 
-`ocli update` / `ocli upgrade` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once.
+`ocli update` / `ocli upgrade` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window.
 
 | Task | Command |
 | --- | --- |
 | Install latest | `npm install -g oases-ocli@latest` |
 | Upgrade to latest (0.1.2+) | `ocli update` or `ocli upgrade` |
 | Upgrade fallback | `npm install -g oases-ocli@latest` |
-| Install a specific version | `npm install -g oases-ocli@0.1.2` |
+| Install a specific version | `npm install -g oases-ocli@0.1.3` |
 | Check installed version | `ocli --help` |
 | Check latest npm version | `npm view oases-ocli version` |
 | Locate global install | `npm root -g` and `which ocli` |
