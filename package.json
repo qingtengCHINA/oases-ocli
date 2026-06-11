@@ -1,6 +1,6 @@
 {
   "name": "oases-ocli",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Local desktop runtime for Oases Chat project mode.",
   "type": "module",
   "scripts": {
@@ -9,8 +9,8 @@
     "test:package": "node scripts/ocli-package-smoke.mjs"
   },
   "bin": {
-    "ocli": "./bin/ocli.js",
-    "oases-ocli": "./bin/ocli.js"
+    "ocli": "bin/ocli.js",
+    "oases-ocli": "bin/ocli.js"
   },
   "files": [
     "bin",

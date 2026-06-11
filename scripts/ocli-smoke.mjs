@@ -911,6 +911,29 @@ try {
   });
   assert(read.payload?.data?.content === "hello ocli", "read_file should return written content");
 
+  const absoluteSmokePath = path.join(workspace, "absolute", "inside.txt");
+  const absoluteWrite = await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: absoluteSmokePath, content: "absolute path inside workspace" }),
+  });
+  assert(absoluteWrite.payload?.ok === true, "write_file should accept absolute paths inside the workspace");
+  assert(absoluteWrite.payload?.data?.path === "absolute/inside.txt", "write_file should normalize workspace-internal absolute paths to relative paths");
+  const absoluteRead = await request("/tools/read_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: absoluteSmokePath }),
+  });
+  assert(absoluteRead.payload?.data?.path === "absolute/inside.txt", "read_file should normalize workspace-internal absolute paths to relative paths");
+  assert(absoluteRead.payload?.data?.content === "absolute path inside workspace", "read_file should read absolute paths inside the workspace");
+  const outsideAbsoluteRead = await request("/tools/read_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: path.join(path.dirname(workspace), "outside.txt") }),
+  });
+  assert(outsideAbsoluteRead.response.status >= 400, "read_file should reject absolute paths outside the workspace");
+  assert(String(outsideAbsoluteRead.payload?.error || "").includes("workspace"), "outside absolute path error should mention workspace boundary");
+
   await request("/tools/write_file", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

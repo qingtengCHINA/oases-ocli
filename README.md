@@ -56,7 +56,12 @@ npm install -g .
 ocli
 ```
 
-If zsh still cannot find the command after installation, run `rehash` and try `ocli` again. After npm publishing, users install from the registry with `npm install -g oases-ocli`.
+If zsh still cannot find the command after installation, run `rehash` and try `ocli` again. `oases-ocli` is published to the npm registry:
+
+```bash
+npm install -g oases-ocli
+ocli
+```
 
 In an interactive terminal, `ocli` shows an animated green Oases status mark while the local runtime is running. The two connected lobes continuously exchange size, so the terminal mark visibly flows while `ocli` is alive. Six seconds after startup, `ocli` opens Oases Web automatically:
 
@@ -72,6 +77,24 @@ After npm publishing:
 npm install -g oases-ocli
 ocli
 ```
+
+Keep `oases-ocli@latest` installed. Starting with `0.1.1`, filesystem tools accept both relative paths and absolute paths that are inside the current `workspace`. For example, if `ocli` is started from `/Users/qingteng`, then `/Users/qingteng/Downloads` is inside the workspace and can be read through file tools. Absolute paths outside the workspace remain blocked by the filesystem boundary.
+
+Common npm commands:
+
+`ocli update` / `ocli upgrade` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once.
+
+| Task | Command |
+| --- | --- |
+| Install latest | `npm install -g oases-ocli@latest` |
+| Upgrade to latest (0.1.2+) | `ocli update` or `ocli upgrade` |
+| Upgrade fallback | `npm install -g oases-ocli@latest` |
+| Install a specific version | `npm install -g oases-ocli@0.1.2` |
+| Check installed version | `ocli --help` |
+| Check latest npm version | `npm view oases-ocli version` |
+| Locate global install | `npm root -g` and `which ocli` |
+| Uninstall | `npm uninstall -g oases-ocli` |
+| Run without installing | `npx oases-ocli@latest` |
 
 One-off usage without installing also works:
 
@@ -89,7 +112,7 @@ Then open Oases Chat Web in project mode. The Web app connects to `http://127.0.
 - Send OpenAI-compatible tool schemas to the Oases Web model proxy with `tool_choice: "auto"`.
 - Execute both Oases `<tool>{...}</tool>` text tool blocks and OpenAI-compatible streamed `delta.tool_calls`.
 - Never require users to configure a local model provider or API key.
-- Restrict all filesystem tools to the configured workspace.
+- Restrict all filesystem tools to the configured workspace. Relative paths and workspace-internal absolute paths are normalized to workspace-relative paths; absolute paths outside the workspace are rejected.
 - Support engineering-grade workspace discovery through `glob_files`, regex-capable `grep_files`, and targeted `read_file` line ranges.
 - Support bounded sub-agent delegation through `agent_run`, including current-session background launches via `runInBackground: true` and result polling through `agent_status`, using the same Web-provided model/API proxy and the same local workspace permission flow.
 - Support `agent_run(isolation: "worktree")` for git-backed workspaces. In this mode, `ocli` creates a detached temporary worktree from `HEAD`, runs the sub-agent inside that isolated root, and returns the worktree path plus `workspace_status` so the main agent can inspect the isolated changes without polluting the main workspace.

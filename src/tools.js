@@ -3,7 +3,7 @@ import path from "node:path";
 import { PROJECT_TOOL_NAMES } from "./constants.js";
 import { fetchUrl } from "./network.js";
 import { commandContainsShellControlOperators, getDangerousCommandReason, runProcess } from "./process.js";
-import { listFiles, workspacePath } from "./workspace.js";
+import { listFiles, workspacePath, workspaceRelativePath } from "./workspace.js";
 
 const DEFAULT_IGNORED_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", ".turbo", ".cache", "coverage", ".oases"]);
 const TEXT_PREVIEW_EXTENSIONS = new Set([".c", ".cc", ".cpp", ".css", ".csv", ".go", ".html", ".js", ".json", ".jsx", ".md", ".mjs", ".py", ".rs", ".sh", ".ts", ".tsx", ".txt", ".vue", ".xml", ".yaml", ".yml"]);
@@ -844,7 +844,7 @@ function buildEditDiff(filePath, oldText, newText, replacements) {
 }
 
 async function editFile(root, body) {
-  const filePath = String(body.path || "");
+  const filePath = body.path ? workspaceRelativePath(root, body.path) : "";
   const oldText = typeof body.oldText === "string" ? body.oldText : "";
   const newText = typeof body.newText === "string" ? body.newText : "";
   const replaceAll = body.replaceAll === true;
@@ -876,15 +876,15 @@ export const TOOL_REGISTRY = {
   list_files: {
     name: "list_files",
     title: "List files",
-    description: "List files and folders under a relative workspace path.",
+    description: "List files and folders under a workspace path. Accepts relative paths or absolute paths inside the current workspace.",
     risk: "read",
-    inputSchema: { type: "object", properties: { path: { type: "string", description: "Relative folder path inside the workspace." } } },
+    inputSchema: { type: "object", properties: { path: { type: "string", description: "Relative folder path or absolute path inside the workspace." } } },
     execute: (root, body) => listFiles(root, body).then((entries) => ({ entries })),
   },
   search_files: {
     name: "search_files",
     title: "Search files",
-    description: "Recursively search workspace file paths by query or wildcard pattern.",
+    description: "Recursively search workspace file paths by query or wildcard pattern. Optional path accepts a relative path or absolute path inside the current workspace.",
     risk: "read",
     inputSchema: { type: "object", properties: { path: { type: "string" }, query: { type: "string" }, pattern: { type: "string" }, maxResults: { type: "number" } } },
     execute: (root, body) => searchFiles(root, body),
@@ -892,7 +892,7 @@ export const TOOL_REGISTRY = {
   glob_files: {
     name: "glob_files",
     title: "Glob files",
-    description: "Fast file pattern matching inside the workspace. Supports glob patterns like **/*.js or src/**/*.ts and returns matches sorted by modification time.",
+    description: "Fast file pattern matching inside the workspace. Optional path accepts a relative path or absolute path inside the current workspace. Supports glob patterns like **/*.js or src/**/*.ts and returns matches sorted by modification time.",
     risk: "read",
     inputSchema: { type: "object", properties: { path: { type: "string" }, glob: { type: "string" }, pattern: { type: "string" }, type: { type: "string", description: "Optional file type such as js, ts, py, rust, go, json, md, css, html, vue, yaml, or shell." }, maxResults: { type: "number" } } },
     execute: (root, body) => globFiles(root, body),
@@ -900,7 +900,7 @@ export const TOOL_REGISTRY = {
   grep_files: {
     name: "grep_files",
     title: "Grep files",
-    description: "Recursively search UTF-8 workspace files for literal or regex text matches. Supports glob/type filters and output modes: content, files_with_matches, count.",
+    description: "Recursively search UTF-8 workspace files for literal or regex text matches. Optional path accepts a relative path or absolute path inside the current workspace. Supports glob/type filters and output modes: content, files_with_matches, count.",
     risk: "read",
     inputSchema: { type: "object", properties: { path: { type: "string" }, query: { type: "string" }, regex: { type: "string" }, useRegex: { type: "boolean" }, glob: { type: "string" }, pattern: { type: "string" }, type: { type: "string" }, outputMode: { type: "string", enum: ["content", "files_with_matches", "count"] }, caseSensitive: { type: "boolean" }, maxResults: { type: "number" } } },
     execute: (root, body) => grepFiles(root, body),
@@ -948,27 +948,29 @@ export const TOOL_REGISTRY = {
   read_file: {
     name: "read_file",
     title: "Read file",
-    description: "Read a UTF-8 text file from the local workspace. Optional offset/limit reads a targeted line range; numbered returns cat -n style line numbers.",
+    description: "Read a UTF-8 text file from the local workspace. Accepts a relative path or absolute path inside the current workspace. Optional offset/limit reads a targeted line range; numbered returns cat -n style line numbers.",
     risk: "read",
-    inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string", description: "Relative file path inside the workspace." }, offset: { type: "number", description: "Zero-based line offset." }, limit: { type: "number", description: "Maximum number of lines to read, capped at 2000." }, numbered: { type: "boolean", description: "Return cat -n style line numbers." }, maxChars: { type: "number" } } },
+    inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string", description: "Relative file path or absolute path inside the workspace." }, offset: { type: "number", description: "Zero-based line offset." }, limit: { type: "number", description: "Maximum number of lines to read, capped at 2000." }, numbered: { type: "boolean", description: "Return cat -n style line numbers." }, maxChars: { type: "number" } } },
     execute: async (root, body) => {
-      const target = workspacePath(root, body.path);
+      const normalizedPath = workspaceRelativePath(root, body.path);
+      const target = workspacePath(root, normalizedPath);
       const content = await readFile(target, "utf8");
-      return { path: body.path, ...readFileRangeContent(content, body) };
+      return { path: normalizedPath, ...readFileRangeContent(content, body) };
     },
   },
   write_file: {
     name: "write_file",
     title: "Write file",
-    description: "Write a UTF-8 text file inside the local workspace, creating parent folders as needed.",
+    description: "Write a UTF-8 text file inside the local workspace, creating parent folders as needed. Accepts a relative path or absolute path inside the current workspace.",
     risk: "write",
     inputSchema: { type: "object", required: ["path", "content"], properties: { path: { type: "string" }, content: { type: "string" } } },
     execute: async (root, body) => {
-      const target = workspacePath(root, body.path);
+      const normalizedPath = workspaceRelativePath(root, body.path);
+      const target = workspacePath(root, normalizedPath);
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, String(body.content ?? ""), "utf8");
       const info = await stat(target);
-      return { path: body.path, bytes: info.size, artifacts: [fileArtifact(body.path, info, "created_or_updated_file")] };
+      return { path: normalizedPath, bytes: info.size, artifacts: [fileArtifact(normalizedPath, info, "created_or_updated_file")] };
     },
   },
   edit_file: {
@@ -982,13 +984,14 @@ export const TOOL_REGISTRY = {
   delete_file: {
     name: "delete_file",
     title: "Delete file",
-    description: "Delete a file or folder inside the local workspace.",
+    description: "Delete a file or folder inside the local workspace. Accepts a relative path or absolute path inside the current workspace.",
     risk: "destructive",
     inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
     execute: async (root, body) => {
-      const target = workspacePath(root, body.path);
+      const normalizedPath = workspaceRelativePath(root, body.path);
+      const target = workspacePath(root, normalizedPath);
       await rm(target, { recursive: true, force: false });
-      return { path: body.path, artifacts: [{ type: "file", role: "deleted_file", path: body.path }] };
+      return { path: normalizedPath, artifacts: [{ type: "file", role: "deleted_file", path: normalizedPath }] };
     },
   },
   fetch_url: {
@@ -1002,7 +1005,7 @@ export const TOOL_REGISTRY = {
   run_command: {
     name: "run_command",
     title: "Run shell command",
-    description: "Run a shell command inside the workspace with timeout and basic dangerous-command blocking.",
+    description: "Run a shell command with timeout and basic dangerous-command blocking. By default cwd is the workspace root; cwd may be a relative path or absolute path inside the workspace. Shell commands may reference absolute paths when the user explicitly requested them, but high-risk commands require approval.",
     risk: "execution",
     inputSchema: { type: "object", required: ["command"], properties: { command: { type: "string" }, cwd: { type: "string" }, timeoutMs: { type: "number" } } },
     execute: async (root, body, options) => {
@@ -1020,7 +1023,7 @@ export const TOOL_REGISTRY = {
   run_python: {
     name: "run_python",
     title: "Run Python",
-    description: "Run a Python snippet inside the workspace with timeout.",
+    description: "Run a Python snippet with timeout. By default cwd is the workspace root; cwd may be a relative path or absolute path inside the workspace.",
     risk: "execution",
     inputSchema: { type: "object", required: ["script"], properties: { script: { type: "string" }, cwd: { type: "string" }, python: { type: "string" }, timeoutMs: { type: "number" } } },
     execute: async (root, body, options) => {

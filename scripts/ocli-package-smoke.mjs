@@ -36,8 +36,8 @@ function run(command, args, cwd = packageRoot) {
 const manifest = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
 assert(manifest.name === "oases-ocli", "package name should be oases-ocli for npx oases-ocli");
 assert(manifest.type === "module", "package should be ESM");
-assert(manifest.bin?.ocli === "./bin/ocli.js", "package should expose the ocli binary");
-assert(manifest.bin?.["oases-ocli"] === "./bin/ocli.js", "package should expose the oases-ocli binary");
+assert(manifest.bin?.ocli === "bin/ocli.js", "package should expose the ocli binary");
+assert(manifest.bin?.["oases-ocli"] === "bin/ocli.js", "package should expose the oases-ocli binary");
 assert(Array.isArray(manifest.files) && manifest.files.includes("bin") && manifest.files.includes("src"), "package should publish the official runtime files");
 assert(manifest.publishConfig?.access === "public", "package should be configured for public npm publishing");
 assert(manifest.repository?.url === "git+https://github.com/qingtengCHINA/oases-ocli.git", "package should point to the public GitHub repository");
@@ -46,9 +46,10 @@ assert(manifest.homepage === "https://github.com/qingtengCHINA/oases-ocli#readme
 assert(manifest.license === "Apache-2.0", "package should use Apache-2.0 license");
 
 const help = await run(process.execPath, ["bin/ocli.js", "--help"]);
-assert(help.stdout.includes("ocli 0.1.0"), "packaged CLI should print help");
+assert(help.stdout.includes("ocli 0.1.2"), "packaged CLI should print help");
 assert(help.stdout.includes("\n  ocli\n"), "packaged CLI help should include zero-argument startup");
 assert(help.stdout.includes("ocli --workspace ~/Projects/my-app"), "packaged CLI help should include short workspace example");
+assert(help.stdout.includes("ocli update"), "packaged CLI help should include self-update command");
 
 const defaultArgs = parseArgs(["node", "bin/ocli.js"]);
 assert(defaultArgs.command === "serve", "CLI parser should default to serve when no command is provided");
@@ -61,6 +62,15 @@ assert(shortWorkspaceArgs.workspace === ".", "CLI parser should preserve workspa
 const pnpmDelimitedArgs = parseArgs(["node", "bin/ocli.js", "--", "serve", "--workspace", "."]);
 assert(pnpmDelimitedArgs.command === "serve", "CLI parser should ignore a pnpm/npm -- argument delimiter");
 assert(pnpmDelimitedArgs.workspace === ".", "CLI parser should preserve arguments after a pnpm/npm -- delimiter");
+
+const updateArgs = parseArgs(["node", "bin/ocli.js", "update", "--dry-run"]);
+assert(updateArgs.command === "update", "CLI parser should support update command");
+assert(updateArgs.dryRun === true, "CLI parser should preserve update --dry-run");
+const upgradeArgs = parseArgs(["node", "bin/ocli.js", "upgrade"]);
+assert(upgradeArgs.command === "upgrade", "CLI parser should support upgrade alias");
+
+const updateDryRun = await run(process.execPath, ["bin/ocli.js", "update", "--dry-run"]);
+assert(updateDryRun.stdout.includes("npm install -g oases-ocli@latest"), "update --dry-run should print the npm update command");
 
 const packed = await run("npm", ["pack", "--dry-run", "--json"]);
 const packInfo = JSON.parse(packed.stdout)[0];
@@ -81,8 +91,10 @@ try {
   await run("npm", ["init", "-y"], installRoot);
   await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], installRoot);
   const installedHelp = await run(process.platform === "win32" ? "node_modules\\.bin\\oases-ocli.cmd" : "node_modules/.bin/oases-ocli", ["--help"], installRoot);
-  assert(installedHelp.stdout.includes("ocli 0.1.0"), "installed tarball should expose the oases-ocli binary");
+  assert(installedHelp.stdout.includes("ocli 0.1.2"), "installed tarball should expose the oases-ocli binary");
   assert(installedHelp.stdout.includes("\n  ocli\n"), "installed tarball help should include zero-argument startup");
+  const installedUpdateDryRun = await run(process.platform === "win32" ? "node_modules\\.bin\\ocli.cmd" : "node_modules/.bin/ocli", ["upgrade", "--dry-run"], installRoot);
+  assert(installedUpdateDryRun.stdout.includes("npm install -g oases-ocli@latest"), "installed tarball should expose update/upgrade dry-run");
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
 }

@@ -36,7 +36,7 @@ The end state is:
 | 4. Continuous task orchestration | Done | Make project tasks continue until completion without user nudging | Task state, auto-continue slices, completion criteria, stronger max-turn handling | `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Production deployed |
 | 5. Session recovery and audit UX | Done | Make local sessions first-class recoverable engineering artifacts | Session detail panel, categorized timeline, artifact list, resume/continue from session | `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Production deployed |
 | 6. Skills, agents, and plugins | In progress | Bring in higher-level `ocli-test` orchestration | Skill loading, agent delegation, task/todo tools, plugin path strategy | Skill/tool integration smoke | Deploy after pass |
-| 7. npm/GitHub release readiness | In progress | Publishable CLI and GitHub workflow | License/repository fields, release workflow, npm dry-run, install docs | Package/tarball install smoke passed; repository metadata and Apache-2.0 license done; npm publish pending | Release after approval |
+| 7. npm/GitHub release readiness | Done | Publishable CLI and GitHub workflow | License/repository fields, release workflow, npm dry-run, install docs, npm registry release | `oases-ocli@0.1.1` published to npm; local global upgrade smoke passed | Published |
 | 8. Terminal UX | Done | Make local ocli feel alive and obvious to operate | Animated Oases terminal mark, auto-open Web, stable CI output | `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Local runtime only |
 | 9. Search/read tool parity | Done | Move closer to `ocli-test` Glob/Grep/Read usefulness | `glob_files`, regex/type/output grep modes, line-range numbered reads | `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Local runtime only |
 | 10. Sub-agent v1 | Done | Bring first `ocli-test` AgentTool-style delegation into Oases protocol | `agent_run` tool, bounded nested agent loop, subagent events, smoke coverage | `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Local runtime only |
@@ -52,6 +52,8 @@ The end state is:
 | 20. Custom agent effort v1 | Done | Bring `ocli-test` custom agent effort frontmatter into Oases sub-agent requests without local model ownership | `effort` frontmatter parsing, sub-agent reasoning effort override, metadata, smoke coverage | `node --check`, `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Local runtime only |
 | 21. Standalone CLI push folder | Done | Give the user a clean folder that can be pushed as a separate GitHub/npm package source | `oases-ocli/` with package manifest, bin, runtime source, standalone smoke tests, docs, ignore files; README push guidance | `cd oases-ocli && npm test`, root `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` | Local docs/package structure only |
 | 22. Zero-argument CLI startup | Done | Make the published terminal experience start with `ocli` instead of `ocli serve --workspace .` | CLI parser defaults to `serve`, help/docs promote `ocli`, package smoke covers zero-arg and leading-flag forms | `cd oases-ocli && npm test`, root `pnpm test:ocli`, `pnpm test:ocli-package`, `pnpm build` passed | Local CLI UX only |
+| 24. Workspace absolute paths and oases prompt | Done | Fix Web/CLI disagreement where `/Users/qingteng/Downloads` was wrongly treated as outside `workspace: /Users/qingteng` | `workspaceRelativePath`, file tool absolute-path normalization, Web project prompt from `oasesprompt.md`, Web pre-validation bypass for connected ocli, `0.1.1` package bump | `pnpm test:ocli`, `pnpm test:ocli-package`, `cd oases-ocli && npm test`, `pnpm build`, npm registry/local install checks passed | Published `oases-ocli@0.1.1`; Web production deployed |
+| 25. Self-update command | In progress | Let users upgrade with `ocli update` or `ocli upgrade` instead of remembering npm syntax | CLI parser aliases, `src/updater.js`, entrypoint wiring, help/docs, package smoke dry-run coverage, `0.1.2` package bump | `pnpm test:ocli-package` and `cd oases-ocli && npm test` passed | npm publish waiting for npm 2FA OTP |
 
 ## Phase 1 Detailed Checklist
 
@@ -138,7 +140,9 @@ The end state is:
 | 7.4 Repository metadata | Done | `ocli/package.json`, `oases-ocli/package.json`, docs | GitHub repository is `https://github.com/qingtengCHINA/oases-ocli`; package manifests now include `repository`, `bugs`, and `homepage`. |
 | 7.5 License decision | Done | `ocli/package.json`, `ocli/LICENSE`, `oases-ocli/package.json`, `oases-ocli/LICENSE`, docs | User chose `Apache-2.0`; package manifests and LICENSE files now reflect that choice. |
 | 7.6 GitHub validation workflow | Done | `.github/workflows/ocli-ci.yml`, `oases-ocli/.github/workflows/ci.yml` | Added monorepo CI for Web-integrated validation and standalone CLI CI for `npm test` plus `npm pack --dry-run`. npm publish workflow remains pending until license/npm token policy is confirmed. |
-| 7.7 Real npm publish | Pending | npm | Run after npm login/token setup: `npm test`, `npm pack --dry-run`, then `npm publish --access public` from `oases-ocli/`. |
+| 7.7 Real npm publish | Done | npm | Published `oases-ocli@0.1.0` from `oases-ocli/` under npm account `qingtengpro`; verified `npm view oases-ocli` and clean global-prefix install with `npm install -g oases-ocli`. |
+| 7.8 npm patch release | Done | npm, `oases-ocli/package.json` | Published `oases-ocli@0.1.1`; `npm view oases-ocli version dist-tags bin --json` reports latest `0.1.1`, and local global upgrade now prints `ocli 0.1.1`. |
+| 7.9 npm self-update release | In progress | npm, `oases-ocli/package.json` | `oases-ocli@0.1.2` adds `ocli update` and `ocli upgrade`; local package validation passed, npm publish is waiting for 2FA OTP. |
 
 ## Phase 8 Terminal UX Checklist
 
@@ -376,20 +380,25 @@ The end state is:
 | 2026-06-11 19:28 | Phase 22 completed: changed CLI parsing so `ocli` starts the runtime directly, kept `serve` compatibility, and updated package smoke/docs for the short command. | `cd oases-ocli && npm test`, `pnpm test:ocli`, `pnpm test:ocli-package`, and `pnpm build` passed. Build still has the known CSS minify and chunk-size warnings. | Not deployed; local CLI UX/docs change only. |
 | 2026-06-11 19:41 | Phase 7.4 completed after standalone GitHub publication: recorded `https://github.com/qingtengCHINA/oases-ocli` in package metadata and docs, added standalone CLI GitHub Actions CI. | `cd oases-ocli && npm test`, standalone `npm run test:package`, and root `pnpm test:ocli-package` passed. | Not deployed; package metadata/docs/CI change only. |
 | 2026-06-11 19:49 | Phase 7.5 completed: set oases-ocli license to Apache-2.0, added LICENSE files in both standalone and integrated CLI package folders, and updated package smoke/docs. | `cd oases-ocli && npm test`, standalone `npm run test:package`, and root `pnpm test:ocli-package` passed. | Not deployed; package metadata/docs/license change only. |
+| 2026-06-11 21:39 | Phase 7.7 completed: published `oases-ocli@0.1.0` to the npm registry and restored Web/docs install guidance to `npm install -g oases-ocli`. | `cd oases-ocli && npm test`, `pnpm test:ocli-package`, `pnpm build`, `npm view oases-ocli`, and clean temp-prefix `npm install -g oases-ocli && ocli --help` passed. Build still has known CSS minify/chunk warnings. | npm package published; Web production already shows the registry install command. |
+| 2026-06-11 22:10 | Phase 24 completed: workspace-internal absolute paths are accepted and normalized, Web project prompt now carries oases identity/path rules, and frontend pre-validation no longer blocks connected ocli absolute paths. | `pnpm test:ocli`, `pnpm test:ocli-package`, `cd oases-ocli && npm test`, `pnpm build`, `npm view oases-ocli`, and local `npm install -g oases-ocli@latest && ocli --help` passed. | Published `oases-ocli@0.1.1`; production deployed: `https://oases-chat-km60bnpyk-qingtengs-projects.vercel.app`; aliased to `https://www.oasesai.xyz`; inspect: `https://vercel.com/qingtengs-projects/oases-chat/AndJZaXQsPF7hXtWqhk78stQTP6w`. |
+| 2026-06-11 22:46 | Phase 25 started: added `ocli update` and `ocli upgrade` self-update aliases that run `npm install -g oases-ocli@latest`. | `node --check`, `pnpm test:ocli-package`, and `cd oases-ocli && npm test` passed. `npm publish --access public` prepared `oases-ocli@0.1.2` tarball but npm returned EOTP. | Waiting for npm 2FA OTP to publish `0.1.2`. |
 
 ## Latest Known Good Validation
 
 ```text
 pnpm test:ocli          passed
 pnpm test:ocli-package  passed
-pnpm build              passed with known CSS minify warning
+cd oases-ocli && npm test passed
+pnpm build              passed with known CSS minify and chunk-size warnings
 ```
 
 Latest production deployment:
 
 ```text
 https://www.oasesai.xyz
-dpl_EQSzr6N87tvan1MJYxsKWsyJYNMu
+https://oases-chat-km60bnpyk-qingtengs-projects.vercel.app
+Inspect: https://vercel.com/qingtengs-projects/oases-chat/AndJZaXQsPF7hXtWqhk78stQTP6w
 ```
 
 Latest preview deployment:
