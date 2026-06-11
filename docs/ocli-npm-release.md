@@ -99,7 +99,7 @@ Oases desktop bridge · ocli · v0.1.0
 
 1. Standalone CLI repository is created at `https://github.com/qingtengCHINA/oases-ocli`.
 2. For this standalone CLI repository, commit the contents of `oases-ocli/`.
-3. Decide the license before the first public npm publish. The current package remains `UNLICENSED` until you choose a license such as MIT, Apache-2.0, or a private/proprietary license.
+3. License is set to `Apache-2.0` in `package.json`, with a root `LICENSE` file included in the package.
 4. Repository metadata is configured in `oases-ocli/package.json`:
 
 ```json
@@ -150,6 +150,13 @@ The repository-level smoke test is stricter and should also pass before publish:
 
 ```bash
 pnpm test:ocli-package
+```
+
+For the standalone CLI repository, run:
+
+```bash
+npm test
+npm pack --dry-run
 ```
 
 Publish the package:

@@ -43,6 +43,7 @@ assert(manifest.publishConfig?.access === "public", "package should be configure
 assert(manifest.repository?.url === "git+https://github.com/qingtengCHINA/oases-ocli.git", "package should point to the public GitHub repository");
 assert(manifest.bugs?.url === "https://github.com/qingtengCHINA/oases-ocli/issues", "package should expose the GitHub issues URL");
 assert(manifest.homepage === "https://github.com/qingtengCHINA/oases-ocli#readme", "package should expose the GitHub README homepage");
+assert(manifest.license === "Apache-2.0", "package should use Apache-2.0 license");
 
 const help = await run(process.execPath, ["bin/ocli.js", "--help"]);
 assert(help.stdout.includes("ocli 0.1.0"), "packaged CLI should print help");
@@ -67,6 +68,7 @@ const files = packInfo.files.map((file) => file.path);
 assert(files.includes("bin/ocli.js"), "npm package should include bin/ocli.js");
 assert(files.includes("src/server.js"), "npm package should include src/server.js");
 assert(files.includes("src/agent.js"), "npm package should include src/agent.js");
+assert(files.includes("LICENSE"), "npm package should include LICENSE");
 assert(!files.some((file) => file.startsWith("../") || file.includes("ocli-test") || file.includes("legacy-mvp-src")), "npm package should not include prototype or archived runtime source");
 
 const tempRoot = await mkdtemp(path.join(tmpdir(), "oases-ocli-package-"));

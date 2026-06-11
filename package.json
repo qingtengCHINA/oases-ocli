@@ -38,6 +38,6 @@
     "url": "https://github.com/qingtengCHINA/oases-ocli/issues"
   },
   "homepage": "https://github.com/qingtengCHINA/oases-ocli#readme",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "private": false
 }
