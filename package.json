@@ -30,6 +30,14 @@
     "desktop",
     "runtime"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qingtengCHINA/oases-ocli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qingtengCHINA/oases-ocli/issues"
+  },
+  "homepage": "https://github.com/qingtengCHINA/oases-ocli#readme",
   "license": "UNLICENSED",
   "private": false
 }

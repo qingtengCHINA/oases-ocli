@@ -2,6 +2,8 @@
 
 This directory is the clean standalone Oases CLI package folder. It is intended to be pushed as a separate GitHub repository or used as the source for the future public `oases-ocli` npm package.
 
+GitHub repository: https://github.com/qingtengCHINA/oases-ocli
+
 Oases Web owns model selection, API proxying, and user-facing conversation state. Local `ocli` owns workspace access, glob/grep/read/edit/write tools, command execution, Python execution, URL fetches, bounded sub-agent delegation, asynchronous agent sessions, SSE progress events, approvals, cancellation, and persisted local audit logs.
 
 This folder deliberately excludes the Web app, Vercel config, the large `ocli-test` reference prototype, the old `legacy-mvp-src` archive, build output, local `.oases` state, tarballs, and environment files.

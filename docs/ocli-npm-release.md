@@ -23,6 +23,12 @@ The clean standalone package source lives at:
 oases-ocli
 ```
 
+GitHub repository:
+
+```text
+https://github.com/qingtengCHINA/oases-ocli
+```
+
 Important files:
 
 - `package.json`: npm manifest for `oases-ocli`.
@@ -91,17 +97,21 @@ Oases desktop bridge · ocli · v0.1.0
 
 ## GitHub Preparation
 
-1. Create a GitHub repository for the app or for the CLI package.
-2. For a standalone CLI repository, commit the contents of `oases-ocli/`.
+1. Standalone CLI repository is created at `https://github.com/qingtengCHINA/oases-ocli`.
+2. For this standalone CLI repository, commit the contents of `oases-ocli/`.
 3. Decide the license before the first public npm publish. The current package remains `UNLICENSED` until you choose a license such as MIT, Apache-2.0, or a private/proprietary license.
-4. Add repository metadata to `oases-ocli/package.json` once the GitHub URL is final:
+4. Repository metadata is configured in `oases-ocli/package.json`:
 
 ```json
 {
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<owner>/<repo>.git"
-  }
+    "url": "git+https://github.com/qingtengCHINA/oases-ocli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qingtengCHINA/oases-ocli/issues"
+  },
+  "homepage": "https://github.com/qingtengCHINA/oases-ocli#readme"
 }
 ```
 

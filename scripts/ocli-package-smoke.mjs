@@ -40,6 +40,9 @@ assert(manifest.bin?.ocli === "./bin/ocli.js", "package should expose the ocli b
 assert(manifest.bin?.["oases-ocli"] === "./bin/ocli.js", "package should expose the oases-ocli binary");
 assert(Array.isArray(manifest.files) && manifest.files.includes("bin") && manifest.files.includes("src"), "package should publish the official runtime files");
 assert(manifest.publishConfig?.access === "public", "package should be configured for public npm publishing");
+assert(manifest.repository?.url === "git+https://github.com/qingtengCHINA/oases-ocli.git", "package should point to the public GitHub repository");
+assert(manifest.bugs?.url === "https://github.com/qingtengCHINA/oases-ocli/issues", "package should expose the GitHub issues URL");
+assert(manifest.homepage === "https://github.com/qingtengCHINA/oases-ocli#readme", "package should expose the GitHub README homepage");
 
 const help = await run(process.execPath, ["bin/ocli.js", "--help"]);
 assert(help.stdout.includes("ocli 0.1.0"), "packaged CLI should print help");
