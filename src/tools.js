@@ -1181,15 +1181,49 @@ export function isReadOnlyShellCommand(command) {
   return false;
 }
 
+function shellCommandMayModifyFiles(command) {
+  const normalized = normalizeShellCommand(command);
+  if (!normalized) return false;
+  if (getDangerousCommandReason(normalized)) return true;
+  const patterns = [
+    /\b(?:rm|rmdir|mv|cp|touch|mkdir|truncate)\b/i,
+    /\b(?:sed|perl)\b[^;&|\n]*\s-i\b/i,
+    /(^|[^<])>>?\s*[^&\s]/,
+    /\btee\b/i,
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|update|upgrade|link|unlink|dedupe|rebuild|ci)\b/i,
+    /\b(?:pip|pip3|uv|poetry)\s+(?:install|add|remove|update|sync|lock)\b/i,
+    /\bgit\s+(?:add|commit|checkout|restore|reset|clean|apply|am|merge|rebase|cherry-pick|pull|stash)\b/i,
+    /\bgit\s+worktree\s+(?:add|remove|prune)\b/i,
+    /\bgit\s+branch\s+(?:-d|-D|--delete)\b/i,
+  ];
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
+function pythonMayModifyFiles(script) {
+  const source = String(script || "");
+  const patterns = [
+    /\bopen\s*\([^)]*,\s*["'][^"']*[wax+][^"']*["']/,
+    /\bPath\s*\([^)]*\)\s*\.\s*(?:write_text|write_bytes|touch|mkdir|rename|replace|unlink|rmdir)\s*\(/,
+    /\b(?:os|shutil)\s*\.\s*(?:remove|unlink|rmdir|removedirs|rename|replace|makedirs|mkdir|rmtree|copy|copy2|copyfile|move)\s*\(/,
+    /\b(?:write_text|write_bytes|unlink|rmdir|mkdir|rename|replace)\s*\(/,
+    /\bsubprocess\s*\.\s*(?:run|call|check_call|check_output|Popen)\s*\([^)]*(?:rm|mv|cp|touch|mkdir|git\s+(?:checkout|reset|clean)|npm\s+(?:install|add|remove))\b/i,
+  ];
+  return patterns.some((pattern) => pattern.test(source));
+}
+
 export function getPermissionPolicy(name, args = {}) {
   if (name === "run_command") {
-    if (isReadOnlyShellCommand(args.command)) {
-      return { requiresApproval: false, category: "read_only_shell", reason: "只读 shell 命令可直接执行。" };
+    const command = String(args.command || "");
+    if (shellCommandMayModifyFiles(command)) {
+      return { requiresApproval: true, category: "file_modifying_shell", reason: "即将在本地 workspace 中执行可能修改或删除文件的 shell 命令。" };
     }
-    return { requiresApproval: true, category: "shell_execution", reason: "即将在本地 workspace 中执行 shell 命令。" };
+    return { requiresApproval: false, category: isReadOnlyShellCommand(command) ? "read_only_shell" : "allowed_shell", reason: "未检测到明显修改或删除文件的 shell 命令，可直接执行。" };
   }
   if (name === "run_python") {
-    return { requiresApproval: true, category: "code_execution", reason: "即将在本地 workspace 中执行 Python 代码。" };
+    if (pythonMayModifyFiles(args.script)) {
+      return { requiresApproval: true, category: "file_modifying_python", reason: "即将在本地 workspace 中执行可能修改或删除文件的 Python 代码。" };
+    }
+    return { requiresApproval: false, category: "allowed_python", reason: "未检测到明显修改或删除文件的 Python 代码，可直接执行。" };
   }
   if (name === "delete_file") {
     return { requiresApproval: true, category: "destructive_file_operation", reason: "即将删除本地 workspace 中的文件或目录。" };
@@ -1201,7 +1235,7 @@ export function getPermissionPolicy(name, args = {}) {
     return { requiresApproval: true, category: "destructive_worktree_operation", reason: "即将移除隔离 worktree；如果 force 为 true，会丢弃其中未应用的变更。" };
   }
   const risk = TOOL_REGISTRY[name]?.risk;
-  return { requiresApproval: risk === "execution" || risk === "destructive", category: risk || "unknown", reason: "该工具需要用户确认。" };
+  return { requiresApproval: risk === "destructive", category: risk || "unknown", reason: "该工具需要用户确认。" };
 }
 
 export function shouldRequireApproval(name, args = {}) {

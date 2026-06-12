@@ -82,14 +82,14 @@ Keep `oases-ocli@latest` installed. Starting with `0.1.1`, filesystem tools acce
 
 Common npm commands:
 
-`ocli update` / `ocli upgrade` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window.
+`ocli update` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window. Starting with `0.1.4`, read-only shell/Python operations run by default, while shell/Python commands that clearly delete, remove, write, or modify files still require user approval.
 
 | Task | Command |
 | --- | --- |
 | Install latest | `npm install -g oases-ocli@latest` |
-| Upgrade to latest (0.1.2+) | `ocli update` or `ocli upgrade` |
+| Upgrade to latest (0.1.2+) | `ocli update` |
 | Upgrade fallback | `npm install -g oases-ocli@latest` |
-| Install a specific version | `npm install -g oases-ocli@0.1.3` |
+| Install a specific version | `npm install -g oases-ocli@0.1.4` |
 | Check installed version | `ocli --help` |
 | Check latest npm version | `npm view oases-ocli version` |
 | Locate global install | `npm root -g` and `which ocli` |
@@ -117,6 +117,7 @@ Then open Oases Chat Web in project mode. The Web app connects to `http://127.0.
 - Support bounded sub-agent delegation through `agent_run`, including current-session background launches via `runInBackground: true` and result polling through `agent_status`, using the same Web-provided model/API proxy and the same local workspace permission flow.
 - Support `agent_run(isolation: "worktree")` for git-backed workspaces. In this mode, `ocli` creates a detached temporary worktree from `HEAD`, runs the sub-agent inside that isolated root, and returns the worktree path plus `workspace_status` so the main agent can inspect the isolated changes without polluting the main workspace.
 - Manage isolated worktree results with `worktree_list`, `worktree_diff`, `worktree_apply`, and `worktree_remove`. Worktree paths are validated against `git worktree list`, `worktree_apply` refuses to overwrite dirty main-workspace paths unless `force: true`, and `worktree_remove` refuses to discard dirty worktrees unless `force: true`.
+- Require approval only for destructive local tools (`delete_file`, `worktree_apply`, `worktree_remove`) plus `run_command` / `run_python` payloads that clearly delete, remove, write, or modify files. Read-oriented shell commands such as `find`, `ls`, `grep`, `pwd`, `git status`, and `git diff` run without prompting; controlled `write_file` / `edit_file` tools stay bounded to the workspace and do not interrupt normal generation workflows.
 - Persist session traces under `.oases/ocli/sessions/<session-id>/`.
 - Include local agent session counts and the latest session summary in `/health` so Oases Web can surface runtime continuity and recovery state.
 - Serve persisted session metadata and events through `GET /agent/sessions/:id` after an `ocli` restart.

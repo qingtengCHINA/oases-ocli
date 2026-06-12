@@ -605,7 +605,7 @@ const fakeApiServer = createServer(async (request, response) => {
     if (text.includes("repeat approval smoke") && !text.includes("repeat approved smoke ok")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
-        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_python\\",\\"arguments\\":{\\"script\\":\\"print(\\\\\\"repeat approved smoke ok\\\\\\")\\"}}</tool>"}}]}',
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_python\\",\\"arguments\\":{\\"script\\":\\"open(\\\\\\"repeat-approval-smoke.txt\\\\\\", \\\\\\"w\\\\\\").write(\\\\\\"ok\\\\\\")\\\\nprint(\\\\\\"repeat approved smoke ok\\\\\\")\\"}}</tool>"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -623,7 +623,7 @@ const fakeApiServer = createServer(async (request, response) => {
     if (text.includes("repeat approved smoke ok") && !text.includes("repeat approval second ok")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
-        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_python\\",\\"arguments\\":{\\"script\\":\\"print(\\\\\\"repeat approved smoke ok\\\\\\")\\"}}</tool>"}}]}',
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_python\\",\\"arguments\\":{\\"script\\":\\"open(\\\\\\"repeat-approval-smoke.txt\\\\\\", \\\\\\"w\\\\\\").write(\\\\\\"ok\\\\\\")\\\\nprint(\\\\\\"repeat approved smoke ok\\\\\\")\\"}}</tool>"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -632,7 +632,7 @@ const fakeApiServer = createServer(async (request, response) => {
     if (text.includes("approval smoke") && !text.includes("工具执行结果")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
-        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_python\\",\\"arguments\\":{\\"script\\":\\"print(\\\\\\"approved smoke ok\\\\\\")\\"}}</tool>"}}]}',
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_python\\",\\"arguments\\":{\\"script\\":\\"open(\\\\\\"approval-smoke.txt\\\\\\", \\\\\\"w\\\\\\").write(\\\\\\"ok\\\\\\")\\\\nprint(\\\\\\"approved smoke ok\\\\\\")\\"}}</tool>"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -641,13 +641,13 @@ const fakeApiServer = createServer(async (request, response) => {
     if (text.includes("readonly command smoke") && !text.includes("工具执行结果")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
-        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_command\\",\\"arguments\\":{\\"command\\":\\"pwd\\"}}</tool>"}}]}',
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_command\\",\\"arguments\\":{\\"command\\":\\"find . -maxdepth 1 -type f\\"}}</tool>"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
       return;
     }
-    if (text.includes("ocli 已运行 pwd")) {
+    if (text.includes("ocli 已运行 find")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"readonly command smoke completed"}}]}',
@@ -1547,7 +1547,7 @@ try {
   assert(typeof approvalSessionId === "string", "approval smoke session should have an id");
   const approvalEvent = await waitForApproval(approvalSessionId);
   assert(approvalEvent.tool === "run_python", "approval request should be for run_python");
-  assert(approvalEvent.category === "code_execution", "approval request should include a permission category");
+  assert(approvalEvent.category === "file_modifying_python", "approval request should include a file-modifying permission category");
   assert(String(approvalEvent.reason || "").includes("Python"), "approval request should include a human-readable reason");
   const approved = await request(`/agent/sessions/${encodeURIComponent(approvalSessionId)}/approvals/${encodeURIComponent(approvalEvent.approvalId)}`, {
     method: "POST",
