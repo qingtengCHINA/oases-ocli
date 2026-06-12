@@ -966,8 +966,9 @@ export const TOOL_REGISTRY = {
     inputSchema: { type: "object", required: ["path", "content"], properties: { path: { type: "string" }, content: { type: "string" } } },
     execute: async (root, body) => {
       const normalizedPath = workspaceRelativePath(root, body.path);
-      const target = workspacePath(root, normalizedPath);
+      let target = workspacePath(root, normalizedPath);
       await mkdir(path.dirname(target), { recursive: true });
+      target = workspacePath(root, normalizedPath);
       await writeFile(target, String(body.content ?? ""), "utf8");
       const info = await stat(target);
       return { path: normalizedPath, bytes: info.size, artifacts: [fileArtifact(normalizedPath, info, "created_or_updated_file")] };
@@ -1178,6 +1179,7 @@ export function isReadOnlyShellCommand(command) {
   if (!normalized) return false;
   if (commandContainsShellControlOperators(normalized)) return false;
   if (/^(pwd|git status(?: .*)?|git diff(?: .*)?|git rev-parse(?: .*)?|git log(?: .*)?)$/.test(normalized)) return true;
+  if (/^find\s+/.test(normalized) && !/\s-(?:delete|exec|execdir|ok|okdir)\b/.test(normalized)) return true;
   return false;
 }
 
@@ -1217,13 +1219,13 @@ export function getPermissionPolicy(name, args = {}) {
     if (shellCommandMayModifyFiles(command)) {
       return { requiresApproval: true, category: "file_modifying_shell", reason: "即将在本地 workspace 中执行可能修改或删除文件的 shell 命令。" };
     }
-    return { requiresApproval: false, category: isReadOnlyShellCommand(command) ? "read_only_shell" : "allowed_shell", reason: "未检测到明显修改或删除文件的 shell 命令，可直接执行。" };
+    return { requiresApproval: true, category: isReadOnlyShellCommand(command) ? "read_only_shell" : "execution_shell", reason: "即将在本机 workspace 中执行 shell 命令。为避免间接执行绕过，agent 发起的 shell 命令默认需要用户确认。" };
   }
   if (name === "run_python") {
     if (pythonMayModifyFiles(args.script)) {
       return { requiresApproval: true, category: "file_modifying_python", reason: "即将在本地 workspace 中执行可能修改或删除文件的 Python 代码。" };
     }
-    return { requiresApproval: false, category: "allowed_python", reason: "未检测到明显修改或删除文件的 Python 代码，可直接执行。" };
+    return { requiresApproval: true, category: "execution_python", reason: "即将在本机 workspace 中执行 Python 代码。为避免间接执行绕过，agent 发起的 Python 代码默认需要用户确认。" };
   }
   if (name === "delete_file") {
     return { requiresApproval: true, category: "destructive_file_operation", reason: "即将删除本地 workspace 中的文件或目录。" };

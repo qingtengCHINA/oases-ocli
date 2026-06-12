@@ -1,17 +1,18 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { extractHtmlMetadata } from "../src/network.js";
+import { extractHtmlMetadata, fetchUrl } from "../src/network.js";
 import { commandLooksDangerous } from "../src/process.js";
-import { isReadOnlyShellCommand } from "../src/tools.js";
+import { handleTool, isReadOnlyShellCommand } from "../src/tools.js";
 
 const port = Number(process.env.OCLI_SMOKE_PORT || 8797);
 const fakeApiPort = Number(process.env.OCLI_SMOKE_API_PORT || 8798);
 const baseUrl = `http://127.0.0.1:${port}`;
 const fakeApiBaseUrl = `http://127.0.0.1:${fakeApiPort}/v1`;
 const workspace = await mkdtemp(path.join(tmpdir(), "oases-ocli-smoke-"));
+const outsideWorkspace = await mkdtemp(path.join(tmpdir(), "oases-ocli-outside-"));
 
 const htmlMetadata = extractHtmlMetadata(
   "<!doctype html><html><head><title>Oil News Today | OilPrice.com</title></head><body><a href=\"/Latest-Energy-News/World-News/Page-2.html\">Next</a><a href=\"https://example.com/story\">Story</a></body></html>",
@@ -32,6 +33,24 @@ assert(commandLooksDangerous("git diff -- src; rm -rf ."), "dangerous command de
 assert(!commandLooksDangerous("git status --short"), "dangerous command detection should allow harmless git status");
 assert(isReadOnlyShellCommand("git diff -- src"), "read-only shell policy should allow simple git diff");
 assert(!isReadOnlyShellCommand("git diff -- src; rm -rf ."), "read-only shell policy should reject chained commands");
+
+let privateFetchBlocked = false;
+try {
+  await fetchUrl({ url: "http://127.0.0.1:1/", maxChars: 1000 });
+} catch {
+  privateFetchBlocked = true;
+}
+assert(privateFetchBlocked, "fetch_url should reject localhost/private network targets before connecting");
+
+await writeFile(path.join(outsideWorkspace, "secret.txt"), "outside workspace", "utf8");
+await symlink(outsideWorkspace, path.join(workspace, "outside-link"), "dir");
+let symlinkEscapeBlocked = false;
+try {
+  await handleTool(workspace, "read_file", { path: "outside-link/secret.txt" });
+} catch {
+  symlinkEscapeBlocked = true;
+}
+assert(symlinkEscapeBlocked, "workspace path validation should reject symlink escapes outside the workspace");
 
 function runLocal(command, args = [], cwd = workspace) {
   return new Promise((resolve, reject) => {
@@ -1595,10 +1614,19 @@ try {
     }),
   });
   assert(readonlyCommandStarted.response.status === 202, "readonly command smoke session should start");
+  const readonlyApprovalEvent = await waitForApproval(readonlyCommandStarted.payload?.data?.id);
+  assert(readonlyApprovalEvent.tool === "run_command", "read-only command smoke should request approval for run_command");
+  assert(readonlyApprovalEvent.category === "read_only_shell", "read-only command approval should preserve the read-only shell category");
+  const readonlyApproved = await request(`/agent/sessions/${encodeURIComponent(readonlyCommandStarted.payload?.data?.id)}/approvals/${encodeURIComponent(readonlyApprovalEvent.approvalId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision: "approve" }),
+  });
+  assert(readonlyApproved.payload?.data?.approved === true, "read-only command approval endpoint should approve the pending tool");
   const readonlyCommandCompleted = await waitForSessionDone(readonlyCommandStarted.payload?.data?.id);
-  assert(readonlyCommandCompleted?.data?.status === "completed", "readonly command smoke session should complete without approval");
+  assert(readonlyCommandCompleted?.data?.status === "completed", "readonly command smoke session should complete after approval");
   assert(readonlyCommandCompleted?.data?.result?.finalText?.includes("readonly command smoke completed"), "readonly command smoke should reach the final model response");
-  assert(!readonlyCommandCompleted?.events?.some((event) => event?.type === "approval_required"), "read-only shell commands should not request approval");
+  assert(readonlyCommandCompleted?.events?.some((event) => event?.type === "approval_required" && event?.tool === "run_command"), "agent shell commands should request approval by default");
 
   const autoContinuationStarted = await request("/agent/sessions", {
     method: "POST",
@@ -1693,7 +1721,7 @@ try {
   await waitForServer(child);
 
   const persistedCrawlerDetail = await request(`/agent/sessions/${encodeURIComponent(crawlerArtifactSessionId)}`);
-  assert(persistedCrawlerDetail.response.ok, `persisted crawler artifact session detail should be available after ocli restart: ${persistedCrawlerDetail.response.status} ${JSON.stringify(persistedCrawlerDetail.payload)}`);
+  assert(persistedCrawlerDetail.response.ok, "persisted crawler artifact session detail should be available after ocli restart");
   assert(persistedCrawlerDetail.payload?.artifacts?.some((artifact) => artifact?.path === "crawler/oilprice_crawler.py"), "persisted session detail should expose crawler code artifacts");
   assert(persistedCrawlerDetail.payload?.artifacts?.some((artifact) => artifact?.path === "data/oilprice_news_sample.json"), "persisted session detail should expose dataset artifacts");
   assert(persistedCrawlerDetail.payload?.todos?.some((todo) => todo?.text === "Write crawler code"), "persisted session detail should expose latest todo snapshot");
@@ -1755,5 +1783,6 @@ try {
   await new Promise((resolve) => child.once("exit", resolve));
   await new Promise((resolve) => fakeApiServer.close(resolve));
   await rm(workspace, { recursive: true, force: true });
+  await rm(outsideWorkspace, { recursive: true, force: true });
   if (child.exitCode && child.exitCode !== 143 && stderr.trim()) console.error(stderr.trim());
 }

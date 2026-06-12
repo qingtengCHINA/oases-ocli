@@ -1,5 +1,21 @@
+import { existsSync, realpathSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
+
+function assertInsideRoot(realRoot, candidate, message = "Path escapes the workspace.") {
+  const relative = path.relative(realRoot, candidate);
+  if (relative && (relative.startsWith("..") || path.isAbsolute(relative))) throw new Error(message);
+}
+
+function nearestExistingPath(target) {
+  let current = target;
+  while (!existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) return current;
+    current = parent;
+  }
+  return current;
+}
 
 export function workspaceRelativePath(root, value) {
   const raw = typeof value === "string" ? value.trim().replace(/\\+/g, "/") : "";
@@ -26,8 +42,12 @@ export function workspaceRelativePath(root, value) {
 
 export function workspacePath(root, value) {
   const relative = workspaceRelativePath(root, value);
-  if (relative === ".") return path.resolve(root);
-  return path.resolve(root, relative);
+  const resolved = relative === "." ? path.resolve(root) : path.resolve(root, relative);
+  const realRoot = realpathSync(root);
+  const existing = nearestExistingPath(resolved);
+  const realExisting = realpathSync(existing);
+  assertInsideRoot(realRoot, realExisting);
+  return resolved;
 }
 
 export async function listFiles(root, body) {

@@ -54,14 +54,14 @@ async function readCompletion(response, onText) {
     const payload = await response.json();
     return { text: extractApiCandidate(payload), toolCalls: extractNativeToolCalls(payload) };
   }
-  const raw = await response.text();
   let finalText = "";
   const streamedToolCalls = [];
-  for (const line of raw.split("\n")) {
+  const consumeLine = (line) => {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) continue;
+    if (!trimmed.startsWith("data:")) return false;
     const data = trimmed.slice(5).trim();
-    if (!data || data === "[DONE]") continue;
+    if (!data) return false;
+    if (data === "[DONE]") return true;
     const parsed = tryParseJson(data);
     const delta = parsed?.choices?.[0]?.delta;
     appendToolCallDelta(streamedToolCalls, delta);
@@ -70,6 +70,39 @@ async function readCompletion(response, onText) {
       finalText += chunk;
       onText?.(finalText, chunk);
     }
+    return false;
+  };
+
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const raw = await response.text();
+    for (const line of raw.split("\n")) {
+      if (consumeLine(line)) break;
+    }
+    return { text: finalText, toolCalls: streamedToolCalls.map(normalizeProjectToolCall).filter(Boolean) };
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let done = false;
+  while (!done) {
+    const result = await reader.read();
+    if (result.done) break;
+    buffer += decoder.decode(result.value, { stream: true });
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      if (consumeLine(line)) {
+        done = true;
+        break;
+      }
+      newlineIndex = buffer.indexOf("\n");
+    }
+  }
+  buffer += decoder.decode();
+  if (!done && buffer.trim()) {
+    consumeLine(buffer);
   }
   return { text: finalText, toolCalls: streamedToolCalls.map(normalizeProjectToolCall).filter(Boolean) };
 }
