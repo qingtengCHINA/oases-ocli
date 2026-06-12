@@ -11,6 +11,7 @@ const port = Number(process.env.OCLI_SMOKE_PORT || 8797);
 const fakeApiPort = Number(process.env.OCLI_SMOKE_API_PORT || 8798);
 const baseUrl = `http://127.0.0.1:${port}`;
 const fakeApiBaseUrl = `http://127.0.0.1:${fakeApiPort}/v1`;
+const smokeToken = "smoke-token";
 const workspace = await mkdtemp(path.join(tmpdir(), "oases-ocli-smoke-"));
 const outsideWorkspace = await mkdtemp(path.join(tmpdir(), "oases-ocli-outside-"));
 
@@ -76,7 +77,8 @@ function runLocal(command, args = [], cwd = workspace) {
 }
 
 async function request(pathname, options = {}) {
-  const response = await fetch(`${baseUrl}${pathname}`, options);
+  const headers = { "X-Oases-Token": smokeToken, ...(options.headers || {}) };
+  const response = await fetch(`${baseUrl}${pathname}`, { ...options, headers });
   const payload = await response.json().catch(() => undefined);
   return { response, payload };
 }
@@ -857,7 +859,7 @@ const fakeApiServer = createServer(async (request, response) => {
 await new Promise((resolve) => fakeApiServer.listen(fakeApiPort, "127.0.0.1", resolve));
 
 function startOcliServer() {
-  return spawn(process.execPath, ["index.js", "serve", "--workspace", workspace, "--port", String(port)], {
+  return spawn(process.execPath, ["index.js", "serve", "--workspace", workspace, "--port", String(port), "--token", smokeToken], {
     cwd: path.resolve(import.meta.dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
@@ -873,6 +875,10 @@ child.stderr.on("data", (chunk) => {
 
 try {
   await waitForServer(child);
+
+  const unauthenticatedHealth = await fetch(`${baseUrl}/health`).then(async (response) => ({ response, payload: await response.json().catch(() => undefined) }));
+  assert(unauthenticatedHealth.response.status === 401, "health without token should require authentication");
+  assert(unauthenticatedHealth.payload?.authRequired === true, "unauthenticated health should explain that a token is required");
 
   const health = await request("/health");
   assert(health.payload?.ok === true, "/health should be ok");

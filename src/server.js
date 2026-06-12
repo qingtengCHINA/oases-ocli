@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { runAgent, validateAgentRequest } from "./agent.js";
 import { BRIDGE_NAME, PROJECT_TOOL_NAMES, RUNTIME_SOURCE, VERSION } from "./constants.js";
@@ -9,8 +10,9 @@ import { handleTool, listToolCapabilities } from "./tools.js";
 
 export async function serve(args) {
   const workspace = path.resolve(args.workspace);
-  const token = args.token || Math.random().toString(36).slice(2, 10);
+  const token = args.token || randomBytes(12).toString("base64url");
   const sessions = createSessionStore(workspace);
+  const isAuthorized = (request) => request.headers["x-oases-token"] === token || request.headers.authorization === `Bearer ${token}`;
   const server = createServer(async (request, response) => {
     const headers = corsHeaders(request);
     if (request.method === "OPTIONS") {
@@ -21,11 +23,15 @@ export async function serve(args) {
     try {
       const url = new URL(request.url || "/", "http://127.0.0.1");
       if (url.pathname === "/health" && request.method === "GET") {
+        if (!isAuthorized(request)) {
+          sendJson(response, 401, { ok: false, name: "ocli", authRequired: true, tokenRequired: true, version: VERSION, protocolVersion: 2 }, headers);
+          return;
+        }
         const sessionHealth = await sessions.healthSummary();
         sendJson(response, 200, { ok: true, name: "ocli", bridgeName: BRIDGE_NAME, runtimeSource: RUNTIME_SOURCE, version: VERSION, workspace, tools: [...PROJECT_TOOL_NAMES], toolCapabilities: listToolCapabilities(), agent: true, agentSessions: true, approvals: true, nativeToolCalls: true, nativeToolSchemas: true, protocolVersion: 2, modelSource: "web", apiSource: "web-proxy", ...sessionHealth }, headers);
         return;
       }
-      if (args.token && request.headers["x-oases-token"] !== token && request.headers.authorization !== `Bearer ${token}`) {
+      if (!isAuthorized(request)) {
         sendJson(response, 401, { ok: false, error: "Invalid ocli token." }, headers);
         return;
       }
@@ -116,7 +122,7 @@ export async function serve(args) {
     }
   });
   server.listen(args.port, "127.0.0.1", () => {
-    const terminalUi = startTerminalStatusUi({ port: args.port, workspace, token: args.token ? token : "", version: VERSION, runtimeSource: RUNTIME_SOURCE });
+    const terminalUi = startTerminalStatusUi({ port: args.port, workspace, token, version: VERSION, runtimeSource: RUNTIME_SOURCE });
     server.once("close", terminalUi.stop);
   });
   return server;

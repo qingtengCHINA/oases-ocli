@@ -1,6 +1,6 @@
 {
   "name": "oases-ocli",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Local desktop runtime for Oases Chat project mode.",
   "type": "module",
   "scripts": {

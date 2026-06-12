@@ -82,14 +82,14 @@ Keep `oases-ocli@latest` installed. Starting with `0.1.1`, filesystem tools acce
 
 Common npm commands:
 
-`ocli update` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window. Starting with `0.1.5`, shell/Python execution requested by an agent requires user approval by default; non-execution tools such as file reads, file search, git status summaries, and public URL fetches still run by default, and dangerous commands are hard-blocked before approval.
+`ocli update` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window. Starting with `0.1.5`, shell/Python execution requested by an agent requires user approval by default; non-execution tools such as file reads, file search, git status summaries, and public URL fetches still run by default, and dangerous commands are hard-blocked before approval. Starting with `0.1.6`, ocli enables local token authentication by default; the terminal prints the token and a Web link containing it.
 
 | Task | Command |
 | --- | --- |
 | Install latest | `npm install -g oases-ocli@latest` |
 | Upgrade to latest (0.1.2+) | `ocli update` |
 | Upgrade fallback | `npm install -g oases-ocli@latest` |
-| Install a specific version | `npm install -g oases-ocli@0.1.5` |
+| Install a specific version | `npm install -g oases-ocli@0.1.6` |
 | Check installed version | `ocli --help` |
 | Check latest npm version | `npm view oases-ocli version` |
 | Locate global install | `npm root -g` and `which ocli` |

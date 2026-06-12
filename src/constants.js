@@ -2,7 +2,7 @@ export const DEFAULT_PORT = 8787;
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_SESSION_EVENTS = 300;
-export const VERSION = "0.1.5";
+export const VERSION = "0.1.6";
 export const RUNTIME_SOURCE = "ocli";
 export const BRIDGE_NAME = "Oases desktop bridge";
 

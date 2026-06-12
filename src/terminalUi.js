@@ -170,9 +170,15 @@ export function renderOasesFrame(frame = 0) {
   return lines.join("\n");
 }
 
-function openOasesWeb() {
+function buildOasesWebUrl(token) {
+  const base = "https://www.oasesai.xyz/";
+  if (!token) return base;
+  return `${base}#/?ocliToken=${encodeURIComponent(token)}`;
+}
+
+function openOasesWeb(token) {
   if (process.env.OCLI_NO_AUTO_OPEN === "1") return;
-  const url = "https://www.oasesai.xyz/";
+  const url = buildOasesWebUrl(token);
   const platformCommands = {
     darwin: ["open", [url]],
     win32: ["cmd", ["/c", "start", "", url]],
@@ -189,6 +195,7 @@ function plainStartupLog({ port, workspace, token, version, runtimeSource }) {
   console.log(`ocli ${version} (${runtimeSource}) listening on http://127.0.0.1:${port}`);
   console.log(`workspace: ${workspace}`);
   if (token) console.log(`token: ${token}`);
+  console.log(`web: ${buildOasesWebUrl(token)}`);
   console.log("正在运行ocli，请打开https://www.oasesai.xyz 选择“工程模式”配合使用");
 }
 
@@ -203,6 +210,7 @@ function renderStatus({ frame, port, workspace, token, version, runtimeSource })
   ];
   if (token) lines.push(`${dim("token:")} ${token}`);
   lines.push("", `${color(0, 215, 75, "正在运行ocli")}，请打开${bold("https://www.oasesai.xyz")} 选择${bold("“工程模式”")}配合使用`);
+  if (token) lines.push(`${dim("web token link:")} ${buildOasesWebUrl(token)}`);
   lines.push(dim("启动 6 秒后会自动打开 Oases Web"));
   lines.push(dim("按 Ctrl+C 停止 ocli"));
   return lines.join("\n");
@@ -211,7 +219,7 @@ function renderStatus({ frame, port, workspace, token, version, runtimeSource })
 export function startTerminalStatusUi(options) {
   if (!supportsInteractiveUi()) {
     plainStartupLog(options);
-    const openTimer = process.stdout.isTTY && process.env.CI !== "true" ? setTimeout(openOasesWeb, 6000) : undefined;
+    const openTimer = process.stdout.isTTY && process.env.CI !== "true" ? setTimeout(() => openOasesWeb(options.token), 6000) : undefined;
     return {
       stop() {
         if (openTimer) clearTimeout(openTimer);
@@ -248,7 +256,7 @@ export function startTerminalStatusUi(options) {
   write(HIDE_CURSOR);
   draw();
   timer = setInterval(draw, 120);
-  openTimer = setTimeout(openOasesWeb, 6000);
+  openTimer = setTimeout(() => openOasesWeb(options.token), 6000);
   process.once("exit", stop);
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
