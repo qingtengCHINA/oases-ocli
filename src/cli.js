@@ -7,6 +7,7 @@ Usage:
   ocli
   ocli [--workspace <path>] [--port <port>] [--token <token>]
   ocli serve [--workspace <path>] [--port <port>] [--token <token>]
+  ocli open [--workspace <path>]
   ocli update
   ocli upgrade
   ocli --help
@@ -14,6 +15,7 @@ Usage:
 Examples:
   ocli
   ocli --workspace ~/Projects/my-app
+  ocli open
   ocli update
   ocli serve --workspace .
   ocli serve --workspace ~/Projects/my-app --port 8787

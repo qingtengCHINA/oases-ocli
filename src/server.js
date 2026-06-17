@@ -4,6 +4,7 @@ import path from "node:path";
 import { runAgent, validateAgentRequest } from "./agent.js";
 import { BRIDGE_NAME, PROJECT_TOOL_NAMES, RUNTIME_SOURCE, VERSION } from "./constants.js";
 import { corsHeaders, readBody, sendJson } from "./http.js";
+import { removeRuntimeInfo, writeRuntimeInfo } from "./open.js";
 import { createSessionStore, sendSse } from "./sessions.js";
 import { startTerminalStatusUi } from "./terminalUi.js";
 import { handleTool, listToolCapabilities } from "./tools.js";
@@ -122,8 +123,12 @@ export async function serve(args) {
     }
   });
   server.listen(args.port, "127.0.0.1", () => {
+    writeRuntimeInfo(workspace, { port: args.port, token, version: VERSION, runtimeSource: RUNTIME_SOURCE }).catch(() => undefined);
     const terminalUi = startTerminalStatusUi({ port: args.port, workspace, token, version: VERSION, runtimeSource: RUNTIME_SOURCE });
-    server.once("close", terminalUi.stop);
+    server.once("close", () => {
+      terminalUi.stop();
+      removeRuntimeInfo(workspace, token).catch(() => undefined);
+    });
   });
   return server;
 }

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { buildOasesWebUrl, openOasesWeb } from "./open.js";
 
 const RESET = "\x1b[0m";
 const HIDE_CURSOR = "\x1b[?25l";
@@ -168,27 +168,6 @@ export function renderOasesFrame(frame = 0) {
     lines.push(line.trimEnd());
   }
   return lines.join("\n");
-}
-
-function buildOasesWebUrl(token) {
-  const base = "https://www.oasesai.xyz/";
-  if (!token) return base;
-  return `${base}#/?ocliToken=${encodeURIComponent(token)}`;
-}
-
-function openOasesWeb(token) {
-  if (process.env.OCLI_NO_AUTO_OPEN === "1") return;
-  const url = buildOasesWebUrl(token);
-  const platformCommands = {
-    darwin: ["open", [url]],
-    win32: ["cmd", ["/c", "start", "", url]],
-    linux: ["xdg-open", [url]],
-  };
-  const command = platformCommands[process.platform];
-  if (!command) return;
-  const child = spawn(command[0], command[1], { detached: true, stdio: "ignore" });
-  child.on("error", () => {});
-  child.unref();
 }
 
 function plainStartupLog({ port, workspace, token, version, runtimeSource }) {

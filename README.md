@@ -18,6 +18,7 @@ This folder deliberately excludes the Web app, Vercel config, the large `ocli-te
 ├── bin/ocli.js
 ├── index.js
 ├── src/
+├── OcliSkills/
 ├── scripts/
 │   ├── ocli-smoke.mjs
 │   └── ocli-package-smoke.mjs
@@ -39,6 +40,7 @@ npm pack --dry-run
 
 - `bin`
 - `src`
+- `OcliSkills`
 - `README.md`
 
 ## Usage
@@ -82,14 +84,16 @@ Keep `oases-ocli@latest` installed. Starting with `0.1.1`, filesystem tools acce
 
 Common npm commands:
 
-`ocli update` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window. Starting with `0.1.5`, shell/Python execution requested by an agent requires user approval by default; non-execution tools such as file reads, file search, git status summaries, and public URL fetches still run by default, and dangerous commands are hard-blocked before approval. Starting with `0.1.6`, ocli enables local token authentication by default; the terminal prints the token and a Web link containing it.
+`ocli update` is available starting with `oases-ocli@0.1.2`. If the user has an older version, use the npm fallback once. Windows legacy `cmd.exe` users should use `0.1.3` or newer; `ocli` automatically falls back to a static terminal status there to avoid repeated animation clears refreshing the whole window. Starting with `0.1.5`, shell/Python execution requested by an agent requires user approval by default; non-execution tools such as file reads, file search, git status summaries, and public URL fetches still run by default, and dangerous commands are hard-blocked before approval. Starting with `0.1.6`, ocli enables local token authentication by default; the terminal prints the token and a Web link containing it, then stores current runtime info under `.oases/ocli/runtime.json`. If the browser is closed or the token needs to be recovered, run `ocli open` from the same workspace to reopen the tokenized Oases Web link.
 
 | Task | Command |
 | --- | --- |
 | Install latest | `npm install -g oases-ocli@latest` |
 | Upgrade to latest (0.1.2+) | `ocli update` |
 | Upgrade fallback | `npm install -g oases-ocli@latest` |
-| Install a specific version | `npm install -g oases-ocli@0.1.6` |
+| Install a specific version | `npm install -g oases-ocli@0.1.7` |
+| Reopen current workspace Web link | `ocli open` |
+| Print current workspace Web link | `ocli open --dry-run` |
 | Check installed version | `ocli --help` |
 | Check latest npm version | `npm view oases-ocli version` |
 | Locate global install | `npm root -g` and `which ocli` |
@@ -122,8 +126,9 @@ Then open Oases Chat Web in project mode. The Web app connects to `http://127.0.
 - Include local agent session counts and the latest session summary in `/health` so Oases Web can surface runtime continuity and recovery state.
 - Serve persisted session metadata and events through `GET /agent/sessions/:id` after an `ocli` restart.
 - Enrich session detail responses with `eventCounts`, `toolResults`, `artifacts`, `todos`, `approvalSummary`, and `resumePrompt` for Web timeline rendering and recovery.
-- Discover workspace-local skills with `skill_list`, read them with `skill_read`, and load them into the current agent session as skill context.
-- Discover workspace-local custom agents with `agent_list`, read them with `agent_read`, and run them through `agent_run({ agentName })`. Custom agent Markdown files live under `.oases/agents`, can provide frontmatter defaults such as `agentType`, `maxTurns`, `background`, `isolation`, `effort`, and `initialPrompt`, and inject their body as sub-agent instructions. Their `tools` and `disallowedTools` frontmatter scopes the sub-agent tool schema and is enforced again before tool execution, so text tool blocks cannot bypass the custom agent boundary. Their `skills` frontmatter preloads matching `.oases/skills` files into the sub-agent's first turn and records those skills in session audit metadata. Their `initialPrompt` frontmatter is prepended to the sub-agent's first user turn and preserved in `agent_run` result metadata. Their `effort` frontmatter can set `low`, `medium`, `high`, or `max` for that sub-agent request without changing the Web-owned model/API. Agent frontmatter supports comma-separated lists, YAML `- item` lists, and `initialPrompt: |` block scalars for multi-line first-turn seeding.
+- Discover Oases skills with `skill_list`, read them with `skill_read`, and load them into the current agent session as skill context. Skills can come from the current workspace under `.oases/skills/<name>/SKILL.md` or from bundled package skills under `OcliSkills/<name>/SKILL.md`; results are labeled with `source: "workspace"` or `source: "bundled"`.
+- Ship bundled `OcliSkills` in the npm package so every user gets baseline skills such as `web-search`, `exa-search`, image helpers, data helpers, and platform-specific helpers immediately after `npm install -g oases-ocli`.
+- Discover workspace-local custom agents with `agent_list`, read them with `agent_read`, and run them through `agent_run({ agentName })`. Custom agent Markdown files live under `.oases/agents`, can provide frontmatter defaults such as `agentType`, `maxTurns`, `background`, `isolation`, `effort`, and `initialPrompt`, and inject their body as sub-agent instructions. Their `tools` and `disallowedTools` frontmatter scopes the sub-agent tool schema and is enforced again before tool execution, so text tool blocks cannot bypass the custom agent boundary. Their `skills` frontmatter preloads matching `.oases/skills` or bundled `OcliSkills` into the sub-agent's first turn and records those skills in session audit metadata. Their `initialPrompt` frontmatter is prepended to the sub-agent's first user turn and preserved in `agent_run` result metadata. Their `effort` frontmatter can set `low`, `medium`, `high`, or `max` for that sub-agent request without changing the Web-owned model/API. Agent frontmatter supports comma-separated lists, YAML `- item` lists, and `initialPrompt: |` block scalars for multi-line first-turn seeding.
 
 ## Migration Direction
 

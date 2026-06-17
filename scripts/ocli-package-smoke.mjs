@@ -39,7 +39,7 @@ assert(manifest.name === "oases-ocli", "package name should be oases-ocli for np
 assert(manifest.type === "module", "package should be ESM");
 assert(manifest.bin?.ocli === "bin/ocli.js", "package should expose the ocli binary");
 assert(manifest.bin?.["oases-ocli"] === "bin/ocli.js", "package should expose the oases-ocli binary");
-assert(Array.isArray(manifest.files) && manifest.files.includes("bin") && manifest.files.includes("src"), "package should publish the official runtime files");
+assert(Array.isArray(manifest.files) && manifest.files.includes("bin") && manifest.files.includes("src") && manifest.files.includes("OcliSkills"), "package should publish the official runtime files and bundled skills");
 assert(manifest.publishConfig?.access === "public", "package should be configured for public npm publishing");
 assert(manifest.repository?.url === "git+https://github.com/qingtengCHINA/oases-ocli.git", "package should point to the public GitHub repository");
 assert(manifest.bugs?.url === "https://github.com/qingtengCHINA/oases-ocli/issues", "package should expose the GitHub issues URL");
@@ -55,9 +55,10 @@ assert(!supportsInteractiveUi(ttyStream, { OCLI_PLAIN_UI: "1" }, "darwin"), "pla
 assert(!supportsInteractiveUi({ isTTY: false }, { WT_SESSION: "1" }, "win32"), "non-TTY output should never animate");
 
 const help = await run(process.execPath, ["bin/ocli.js", "--help"]);
-assert(help.stdout.includes("ocli 0.1.6"), "packaged CLI should print help");
+assert(help.stdout.includes("ocli 0.1.7"), "packaged CLI should print help");
 assert(help.stdout.includes("\n  ocli\n"), "packaged CLI help should include zero-argument startup");
 assert(help.stdout.includes("ocli --workspace ~/Projects/my-app"), "packaged CLI help should include short workspace example");
+assert(help.stdout.includes("ocli open"), "packaged CLI help should include open command");
 assert(help.stdout.includes("ocli update"), "packaged CLI help should include self-update command");
 
 const defaultArgs = parseArgs(["node", "bin/ocli.js"]);
@@ -77,6 +78,8 @@ assert(updateArgs.command === "update", "CLI parser should support update comman
 assert(updateArgs.dryRun === true, "CLI parser should preserve update --dry-run");
 const upgradeArgs = parseArgs(["node", "bin/ocli.js", "upgrade"]);
 assert(upgradeArgs.command === "upgrade", "CLI parser should support upgrade alias");
+const openArgs = parseArgs(["node", "bin/ocli.js", "open", "--workspace", "/tmp/example", "--dry-run"]);
+assert(openArgs.command === "open" && openArgs.workspace === "/tmp/example" && openArgs.dryRun === true, "CLI parser should support open --workspace --dry-run");
 
 const updateDryRun = await run(process.execPath, ["bin/ocli.js", "update", "--dry-run"]);
 assert(updateDryRun.stdout.includes("npm install -g oases-ocli@latest"), "update --dry-run should print the npm update command");
@@ -87,6 +90,8 @@ const files = packInfo.files.map((file) => file.path);
 assert(files.includes("bin/ocli.js"), "npm package should include bin/ocli.js");
 assert(files.includes("src/server.js"), "npm package should include src/server.js");
 assert(files.includes("src/agent.js"), "npm package should include src/agent.js");
+assert(files.includes("src/open.js"), "npm package should include src/open.js");
+assert(files.includes("OcliSkills/web-search/SKILL.md"), "npm package should include bundled OcliSkills");
 assert(files.includes("LICENSE"), "npm package should include LICENSE");
 assert(!files.some((file) => file.startsWith("../") || file.includes("ocli-test") || file.includes("legacy-mvp-src")), "npm package should not include prototype or archived runtime source");
 
@@ -100,10 +105,16 @@ try {
   await run("npm", ["init", "-y"], installRoot);
   await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], installRoot);
   const installedHelp = await run(process.platform === "win32" ? "node_modules\\.bin\\oases-ocli.cmd" : "node_modules/.bin/oases-ocli", ["--help"], installRoot);
-  assert(installedHelp.stdout.includes("ocli 0.1.6"), "installed tarball should expose the oases-ocli binary");
+  assert(installedHelp.stdout.includes("ocli 0.1.7"), "installed tarball should expose the oases-ocli binary");
   assert(installedHelp.stdout.includes("\n  ocli\n"), "installed tarball help should include zero-argument startup");
+  assert(installedHelp.stdout.includes("ocli open"), "installed tarball help should include open command");
   const installedUpdateDryRun = await run(process.platform === "win32" ? "node_modules\\.bin\\ocli.cmd" : "node_modules/.bin/ocli", ["upgrade", "--dry-run"], installRoot);
   assert(installedUpdateDryRun.stdout.includes("npm install -g oases-ocli@latest"), "installed tarball should expose update/upgrade dry-run");
+  await run(process.execPath, [
+    "--input-type=module",
+    "-e",
+    "import { handleTool } from './node_modules/oases-ocli/src/tools.js'; const result = await handleTool(process.cwd(), 'skill_read', { name: 'web-search', maxChars: 2000 }); if (result.source !== 'bundled' || !String(result.content || '').includes('Use browser automation to search the web')) throw new Error('installed package could not read bundled web-search skill');",
+  ], installRoot);
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
 }

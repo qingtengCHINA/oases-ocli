@@ -887,6 +887,11 @@ try {
   assert(health.payload?.modelSource === "web", "/health should declare web-owned model source");
   assert(health.payload?.apiSource === "web-proxy", "/health should declare web proxy API source");
   assert(Array.isArray(health.payload?.toolCapabilities), "/health should expose tool capabilities");
+  const runtimeInfo = JSON.parse(await readTextEventually(path.join(workspace, ".oases", "ocli", "runtime.json")));
+  assert(runtimeInfo.token === smokeToken && runtimeInfo.port === port, "ocli should persist current runtime token and port for ocli open");
+  assert(String(runtimeInfo.webUrl || "").includes(`ocliToken=${smokeToken}`), "runtime info should include tokenized web URL");
+  const openDryRun = await runLocal(process.execPath, ["index.js", "open", "--workspace", workspace, "--dry-run"], path.resolve(import.meta.dirname, ".."));
+  assert(openDryRun.stdout.includes(`ocliToken=${smokeToken}`), "ocli open --dry-run should print the tokenized web URL");
 
   const tools = await request("/tools");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "write_file" && tool.risk === "write"), "/tools should expose write_file metadata");
@@ -970,12 +975,28 @@ try {
     body: JSON.stringify({ maxResults: 10 }),
   });
   assert(skillList.payload?.data?.skills?.some((skill) => skill?.name === "research" && skill?.path === ".oases/skills/research/SKILL.md"), "skill_list should discover workspace-local skills");
+  const bundledSkillList = await request("/tools/skill_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 500 }),
+  });
+  assert(bundledSkillList.payload?.data?.bundledRootAvailable === true, "skill_list should detect bundled OcliSkills");
+  assert(bundledSkillList.payload?.data?.skills?.some((skill) => skill?.name === "web-search" && skill?.source === "bundled" && skill?.path === "OcliSkills/web-search/SKILL.md"), "skill_list should discover bundled OcliSkills");
   const skillRead = await request("/tools/skill_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "research" }),
   });
   assert(skillRead.payload?.data?.content?.includes("Research Skill"), "skill_read should read skill content by name");
+  assert(skillRead.payload?.data?.source === "workspace", "skill_read should label workspace-local skills");
+  const bundledSkillRead = await request("/tools/skill_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web-search", maxChars: 4000 }),
+  });
+  assert(bundledSkillRead.payload?.data?.source === "bundled", "skill_read should label bundled skills");
+  assert(bundledSkillRead.payload?.data?.path === "OcliSkills/web-search/SKILL.md", "skill_read should expose bundled skill path");
+  assert(bundledSkillRead.payload?.data?.content?.includes("Use browser automation to search the web"), "skill_read should read bundled skill content by name");
   const skillReadBlocked = await request("/tools/skill_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

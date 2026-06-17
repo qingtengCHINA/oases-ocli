@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs, printHelp } from "./src/cli.js";
+import { openFromRuntime } from "./src/open.js";
 import { serve } from "./src/server.js";
 import { updateSelf } from "./src/updater.js";
 
@@ -7,6 +8,10 @@ const args = parseArgs(process.argv);
 
 if (args.command === "help" || args.command === "--help") printHelp();
 else if (args.command === "serve") await serve(args);
+else if (args.command === "open") {
+  const code = await openFromRuntime(args);
+  process.exit(code);
+}
 else if (args.command === "update" || args.command === "upgrade") {
   const code = await updateSelf(args);
   process.exit(code);

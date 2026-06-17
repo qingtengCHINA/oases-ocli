@@ -154,12 +154,20 @@ function buildToolResultMessage(results) {
   return `工具执行结果：\n${JSON.stringify(results, null, 2)}`;
 }
 
+function escapeXmlAttr(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function buildSkillContextMessage(skills) {
   if (!skills.length) return "";
   return [
-    "已加载以下工作区技能。接下来必须把这些技能内容当作当前任务的强约束执行；如果技能和用户要求冲突，以用户要求为准并说明取舍。",
+    "已加载以下 Oases 技能。接下来必须把这些技能内容当作当前任务的强约束执行；如果技能和用户要求冲突，以用户要求为准并说明取舍。",
     ...skills.map((skill) => [
-      `<skill_context name="${String(skill.name || "skill").replace(/"/g, "&quot;")}" path="${String(skill.path || "").replace(/"/g, "&quot;")}">`,
+      `<skill_context name="${escapeXmlAttr(skill.name || "skill")}" path="${escapeXmlAttr(skill.path || "")}" source="${escapeXmlAttr(skill.source || "workspace")}" root="${escapeXmlAttr(skill.root || "")}" baseDir="${escapeXmlAttr(skill.baseDir || "")}">`,
       String(skill.content || "").slice(0, 60000),
       "</skill_context>",
     ].join("\n")),
@@ -176,6 +184,9 @@ function normalizeLoadedSkillData(data) {
     name: typeof skill.name === "string" && skill.name ? skill.name : typeof skill.id === "string" && skill.id ? skill.id : path.split("/").at(-2) || "skill",
     description: typeof skill.description === "string" ? skill.description : "",
     path,
+    source: typeof data.source === "string" ? data.source : typeof skill.source === "string" ? skill.source : "workspace",
+    root: typeof data.root === "string" ? data.root : typeof skill.root === "string" ? skill.root : "",
+    baseDir: typeof data.baseDir === "string" ? data.baseDir : typeof skill.baseDir === "string" ? skill.baseDir : "",
     content,
   };
 }

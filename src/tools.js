@@ -1,5 +1,6 @@
 import { copyFile, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PROJECT_TOOL_NAMES } from "./constants.js";
 import { fetchUrl } from "./network.js";
 import { commandContainsShellControlOperators, getDangerousCommandReason, runProcess } from "./process.js";
@@ -21,6 +22,9 @@ const TYPE_EXTENSIONS = {
   yaml: [".yaml", ".yml"],
   shell: [".sh", ".bash", ".zsh"],
 };
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = path.resolve(MODULE_DIR, "..");
+const REPO_ROOT = path.resolve(PACKAGE_ROOT, "..");
 
 function truncateText(text, limit) {
   const value = String(text || "");
@@ -619,6 +623,38 @@ function parseSkillFrontmatter(content) {
   return parseMarkdownFrontmatter(content).metadata;
 }
 
+function isPathInside(parent, target) {
+  const relative = path.relative(parent, target);
+  return relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function maybeDirectory(directory) {
+  try {
+    const info = await stat(directory);
+    if (!info.isDirectory()) return undefined;
+    return await realpath(directory);
+  } catch {
+    return undefined;
+  }
+}
+
+async function bundledSkillsRoot() {
+  const candidates = [
+    path.join(PACKAGE_ROOT, "OcliSkills"),
+    path.join(REPO_ROOT, "oases-ocli", "OcliSkills"),
+    path.join(REPO_ROOT, "ocli", "OcliSkills"),
+  ];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const normalized = path.resolve(candidate);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    const resolved = await maybeDirectory(normalized);
+    if (resolved) return resolved;
+  }
+  return undefined;
+}
+
 async function walkSkillFiles(root, maxResults = 100) {
   const skillsRoot = path.join(root, ".oases", "skills");
   const files = [];
@@ -636,60 +672,145 @@ async function walkSkillFiles(root, maxResults = 100) {
       const absolute = path.join(directory, entry.name);
       const relative = path.relative(root, absolute).replace(/\\+/g, "/");
       if (entry.isDirectory()) await visit(absolute);
-      else if (entry.isFile()) files.push(relative);
+      else if (entry.isFile()) files.push({
+        source: "workspace",
+        root: ".oases/skills",
+        path: relative,
+        absolute,
+        baseDir: path.dirname(absolute),
+      });
     }
   }
   await visit(skillsRoot);
   return files;
 }
 
+async function walkBundledSkillFiles(maxResults = 100) {
+  const skillsRoot = await bundledSkillsRoot();
+  if (!skillsRoot) return { files: [], rootPath: undefined };
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= maxResults) return;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxResults) return;
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(skillsRoot, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) await visit(absolute);
+      else if (entry.isFile()) files.push({
+        source: "bundled",
+        root: "OcliSkills",
+        path: `OcliSkills/${relative}`,
+        absolute,
+        baseDir: path.dirname(absolute),
+      });
+    }
+  }
+  await visit(skillsRoot);
+  return { files, rootPath: skillsRoot };
+}
+
+function skillRecordFromMetadata(file, metadata = {}) {
+  const directoryName = path.basename(path.dirname(file.path));
+  const name = typeof metadata.name === "string" && metadata.name ? metadata.name : directoryName;
+  return {
+    id: name,
+    name,
+    description: typeof metadata.description === "string" ? metadata.description : "",
+    path: file.path,
+    source: file.source,
+    root: file.root,
+    baseDir: file.baseDir,
+  };
+}
+
 async function listSkills(root, body = {}) {
-  const maxResults = Math.max(1, Math.min(100, Number(body.maxResults) || 50));
-  const files = await walkSkillFiles(root, maxResults * 4);
-  const skillFiles = files.filter((file) => /(^|\/)SKILL\.md$/i.test(file)).slice(0, maxResults);
+  const maxResults = Math.max(1, Math.min(500, Number(body.maxResults) || 80));
+  const workspaceFiles = await walkSkillFiles(root, maxResults * 4);
+  const bundled = await walkBundledSkillFiles(maxResults * 4);
+  const allSkillFiles = [...workspaceFiles, ...bundled.files].filter((file) => /(^|\/)SKILL\.md$/i.test(file.path));
+  const skillFiles = allSkillFiles.slice(0, maxResults);
   const skills = [];
   for (const file of skillFiles) {
     try {
-      const content = await readFile(path.join(root, file), "utf8");
+      const content = await readFile(file.absolute, "utf8");
       const metadata = parseSkillFrontmatter(content);
-      const directoryName = path.basename(path.dirname(file));
-      skills.push({
-        id: typeof metadata.name === "string" && metadata.name ? metadata.name : directoryName,
-        name: typeof metadata.name === "string" && metadata.name ? metadata.name : directoryName,
-        description: typeof metadata.description === "string" ? metadata.description : "",
-        path: file,
-      });
+      skills.push(skillRecordFromMetadata(file, metadata));
     } catch {
       // Ignore unreadable skill files.
     }
   }
-  return { skills, count: skills.length, root: ".oases/skills", truncated: skillFiles.length >= maxResults };
+  return {
+    skills,
+    count: skills.length,
+    root: ".oases/skills + OcliSkills",
+    roots: [".oases/skills", "OcliSkills"],
+    bundledRootAvailable: Boolean(bundled.rootPath),
+    truncated: allSkillFiles.length > maxResults,
+  };
 }
 
 async function readSkill(root, body = {}) {
   const requested = String(body.path || body.name || "").trim();
   if (!requested) throw new Error("skill_read requires path or name.");
-  const skills = await listSkills(root, { maxResults: 100 });
+  const skills = await listSkills(root, { maxResults: 500 });
+  const requestedLower = requested.toLowerCase();
   const matched = skills.skills.find((skill) => skill.name === requested || skill.id === requested || skill.path === requested)
-    || skills.skills.find((skill) => skill.name.toLowerCase() === requested.toLowerCase());
+    || skills.skills.find((skill) => skill.name.toLowerCase() === requestedLower || skill.id.toLowerCase() === requestedLower || skill.path.toLowerCase() === requestedLower);
   const skillPath = matched ? matched.path : requested;
   const normalized = skillPath.replace(/^\.\//, "").replace(/\\+/g, "/");
-  if (!normalized.startsWith(".oases/skills/") || normalized.includes("../")) {
-    throw new Error("skill_read can only read files under .oases/skills.");
+  if (normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("skill_read can only read files under .oases/skills or bundled OcliSkills.");
   }
-  const target = workspacePath(root, normalized);
+  let target;
+  let source = matched?.source || "workspace";
+  let rootLabel = matched?.root || ".oases/skills";
+  if (normalized.startsWith("OcliSkills/")) {
+    const skillsRoot = await bundledSkillsRoot();
+    if (!skillsRoot) throw new Error("No bundled OcliSkills directory is available.");
+    const relative = normalized.slice("OcliSkills/".length);
+    target = path.resolve(skillsRoot, relative);
+    const resolvedTarget = await realpath(target).catch(() => target);
+    if (!isPathInside(skillsRoot, resolvedTarget)) throw new Error("skill_read target escapes bundled OcliSkills.");
+    target = resolvedTarget;
+    source = "bundled";
+    rootLabel = "OcliSkills";
+  } else if (normalized.startsWith(".oases/skills/")) {
+    target = workspacePath(root, normalized);
+    source = "workspace";
+    rootLabel = ".oases/skills";
+  } else {
+    throw new Error("skill_read can only read files under .oases/skills or bundled OcliSkills.");
+  }
+  if (!/(^|\/)SKILL\.md$/i.test(normalized)) throw new Error("skill_read can only read SKILL.md files.");
   const info = await stat(target);
   if (!info.isFile()) throw new Error("skill_read target is not a file.");
   if (info.size > 512 * 1024) throw new Error("skill_read target is too large.");
   const content = await readFile(target, "utf8");
   const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
   const preview = truncateText(content, maxChars);
+  const skill = matched || skillRecordFromMetadata({
+    source,
+    root: rootLabel,
+    path: normalized,
+    absolute: target,
+    baseDir: path.dirname(target),
+  }, parseSkillFrontmatter(content));
   return {
     path: normalized,
+    source,
+    root: rootLabel,
+    baseDir: path.dirname(target),
     bytes: info.size,
     content: preview.text,
     truncated: preview.truncated,
-    ...(matched ? { skill: matched } : {}),
+    skill,
   };
 }
 
@@ -1072,16 +1193,16 @@ export const TOOL_REGISTRY = {
   },
   skill_list: {
     name: "skill_list",
-    title: "List workspace skills",
-    description: "List workspace-local Oases skills under .oases/skills. Use this before reading a matching skill.",
+    title: "List Oases skills",
+    description: "List Oases skills from the current workspace .oases/skills and bundled OcliSkills. Use this before reading a matching skill.",
     risk: "read",
     inputSchema: { type: "object", properties: { maxResults: { type: "number" } } },
     execute: (root, body) => listSkills(root, body),
   },
   skill_read: {
     name: "skill_read",
-    title: "Read workspace skill",
-    description: "Read a workspace-local skill file under .oases/skills by skill name or relative path.",
+    title: "Read Oases skill",
+    description: "Read a workspace-local or bundled Oases SKILL.md by skill name or relative path.",
     risk: "read",
     inputSchema: { type: "object", properties: { name: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
     execute: (root, body) => readSkill(root, body),
