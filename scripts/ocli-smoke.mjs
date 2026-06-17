@@ -859,7 +859,7 @@ const fakeApiServer = createServer(async (request, response) => {
 await new Promise((resolve) => fakeApiServer.listen(fakeApiPort, "127.0.0.1", resolve));
 
 function startOcliServer() {
-  return spawn(process.execPath, ["index.js", "serve", "--workspace", workspace, "--port", String(port), "--token", smokeToken], {
+  return spawn(process.execPath, ["bin/ocli.js", "serve", "--workspace", workspace, "--port", String(port), "--token", smokeToken], {
     cwd: path.resolve(import.meta.dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
@@ -890,7 +890,7 @@ try {
   const runtimeInfo = JSON.parse(await readTextEventually(path.join(workspace, ".oases", "ocli", "runtime.json")));
   assert(runtimeInfo.token === smokeToken && runtimeInfo.port === port, "ocli should persist current runtime token and port for ocli open");
   assert(String(runtimeInfo.webUrl || "").includes(`ocliToken=${smokeToken}`), "runtime info should include tokenized web URL");
-  const openDryRun = await runLocal(process.execPath, ["index.js", "open", "--workspace", workspace, "--dry-run"], path.resolve(import.meta.dirname, ".."));
+  const openDryRun = await runLocal(process.execPath, ["bin/ocli.js", "open", "--workspace", workspace, "--dry-run"], path.resolve(import.meta.dirname, ".."));
   assert(openDryRun.stdout.includes(`ocliToken=${smokeToken}`), "ocli open --dry-run should print the tokenized web URL");
 
   const tools = await request("/tools");
@@ -905,6 +905,32 @@ try {
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "todo_write" && tool.risk === "write"), "/tools should expose todo_write metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_list" && tool.risk === "read"), "/tools should expose skill_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_read" && tool.risk === "read"), "/tools should expose skill_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_asset_list" && tool.risk === "read"), "/tools should expose skill_asset_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_asset_read" && tool.risk === "read"), "/tools should expose skill_asset_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_install" && tool.risk === "write"), "/tools should expose skill_install metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "command_list" && tool.risk === "read"), "/tools should expose command_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "command_read" && tool.risk === "read"), "/tools should expose command_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_list" && tool.risk === "read"), "/tools should expose plugin_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_read" && tool.risk === "read"), "/tools should expose plugin_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_capability_list" && tool.risk === "read"), "/tools should expose plugin_capability_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_capability_read" && tool.risk === "read"), "/tools should expose plugin_capability_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_command_list" && tool.risk === "read"), "/tools should expose plugin_command_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_command_read" && tool.risk === "read"), "/tools should expose plugin_command_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_command_install" && tool.risk === "write"), "/tools should expose plugin_command_install metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_hook_list" && tool.risk === "read"), "/tools should expose plugin_hook_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_hook_read" && tool.risk === "read"), "/tools should expose plugin_hook_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_agent_list" && tool.risk === "read"), "/tools should expose plugin_agent_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_agent_read" && tool.risk === "read"), "/tools should expose plugin_agent_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_agent_install" && tool.risk === "write"), "/tools should expose plugin_agent_install metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_skill_list" && tool.risk === "read"), "/tools should expose plugin_skill_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_skill_read" && tool.risk === "read"), "/tools should expose plugin_skill_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_skill_install" && tool.risk === "write"), "/tools should expose plugin_skill_install metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_asset_list" && tool.risk === "read"), "/tools should expose plugin_asset_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_asset_read" && tool.risk === "read"), "/tools should expose plugin_asset_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_install" && tool.risk === "write"), "/tools should expose plugin_install metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_remove" && tool.risk === "destructive"), "/tools should expose plugin_remove metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_enable" && tool.risk === "write"), "/tools should expose plugin_enable metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_disable" && tool.risk === "write"), "/tools should expose plugin_disable metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_list" && tool.risk === "read"), "/tools should expose agent_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_read" && tool.risk === "read"), "/tools should expose agent_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_run" && tool.risk === "agent"), "/tools should expose agent_run metadata");
@@ -997,12 +1023,548 @@ try {
   assert(bundledSkillRead.payload?.data?.source === "bundled", "skill_read should label bundled skills");
   assert(bundledSkillRead.payload?.data?.path === "OcliSkills/web-search/SKILL.md", "skill_read should expose bundled skill path");
   assert(bundledSkillRead.payload?.data?.content?.includes("Use browser automation to search the web"), "skill_read should read bundled skill content by name");
+  const bundledSkillAssets = await request("/tools/skill_asset_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web-search", maxResults: 20 }),
+  });
+  assert(bundledSkillAssets.payload?.data?.source === "bundled", "skill_asset_list should label bundled skill assets");
+  assert(bundledSkillAssets.payload?.data?.assets?.some((asset) => asset?.path === "scripts/browser_search.py" && asset?.type === "file"), "skill_asset_list should list bundled skill scripts");
+  const bundledSkillAssetRead = await request("/tools/skill_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web-search", assetPath: "scripts/browser_search.py", maxChars: 6000 }),
+  });
+  assert(bundledSkillAssetRead.payload?.data?.source === "bundled", "skill_asset_read should label bundled skill assets");
+  assert(bundledSkillAssetRead.payload?.data?.path === "OcliSkills/web-search/scripts/browser_search.py", "skill_asset_read should expose bundled skill asset path");
+  assert(bundledSkillAssetRead.payload?.data?.content?.includes("SOURCES"), "skill_asset_read should read bundled skill script content");
+  const skillAssetBlocked = await request("/tools/skill_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web-search", assetPath: "../exa-search/SKILL.md" }),
+  });
+  assert(skillAssetBlocked.response.status >= 400, "skill_asset_read should reject paths outside the selected skill directory");
+  const installedSkill = await request("/tools/skill_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web-search", targetName: "web-search-local" }),
+  });
+  assert(installedSkill.payload?.data?.installed === true, "skill_install should install a bundled skill into the workspace");
+  assert(installedSkill.payload?.data?.path === ".oases/skills/web-search-local/SKILL.md", "skill_install should report the installed workspace skill path");
+  const installedSkillAsset = await request("/tools/skill_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/skills/web-search-local/scripts/browser_search.py", maxChars: 4000 }),
+  });
+  assert(installedSkillAsset.payload?.data?.source === "workspace", "skill_asset_read should read installed workspace skill assets");
+  assert(installedSkillAsset.payload?.data?.content?.includes("SOURCES"), "skill_install should copy bundled skill scripts");
+  const duplicateSkillInstall = await request("/tools/skill_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web-search", targetName: "web-search-local" }),
+  });
+  assert(duplicateSkillInstall.response.status >= 400, "skill_install should refuse to overwrite existing workspace skills");
   const skillReadBlocked = await request("/tools/skill_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: "../package.json" }),
   });
   assert(skillReadBlocked.response.status >= 400, "skill_read should reject paths outside .oases/skills");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: ".oases/plugins/feature-dev/.claude-plugin/plugin.json",
+      content: JSON.stringify({
+        name: "feature-dev",
+        version: "1.0.0",
+        description: "Feature development workflow",
+        author: { name: "Oases" },
+        mcpServers: { docs: { command: "node", args: ["server.js"], env: { DOCS_TOKEN: "redacted-by-summary" } } },
+        lspServers: { typescript: { command: "typescript-language-server", args: ["--stdio"] } },
+        settings: { model: "oases-code", env: { SAFE_FLAG: "1", OASES_API_KEY: "should-not-leak" } },
+        commandsPaths: ["./commands"],
+        agentsPaths: ["./agents"],
+        skillsPaths: ["./skills"],
+        outputStylesPaths: ["./output-styles"],
+        commandsMetadata: { "feature-dev": { description: "Build a feature safely", allowedTools: ["read_file", "write_file"] } },
+      }, null, 2),
+    }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/README.md", content: "# Feature Dev Plugin\n\nplugin readme marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/commands/feature-dev.md", content: "---\ndescription: Build a feature safely\n---\n\n# Feature command\n\nUse a plan, inspect files, implement, and verify.\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/agents/code-explorer.md", content: "---\nname: code-explorer\ndescription: Explore code structure\nagentType: explore\ntools:\n  - read_file\n  - grep_files\nskills: research\neffort: low\ninitialPrompt: |\n  inspect first\n  then summarize\n---\n\n# Explorer agent\n\nplugin agent marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/skills/review-helper/SKILL.md", content: "---\nname: review-helper\ndescription: Review helper skill\n---\n\n# Review Helper Skill\n\nplugin skill marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/skills/review-helper/references/checklist.md", content: "# Review Checklist\n\nplugin asset reference marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/scripts/check.sh", content: "#!/bin/sh\nprintf 'plugin asset script marker\\n'\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/hooks/hooks.json", content: JSON.stringify({ description: "Feature hook config", hooks: { PreToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.py", timeout: 5 }] }] } }, null, 2) + "\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/hooks/pretooluse.py", content: "print('plugin hook handler marker')\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/hooks-handlers/session-start.sh", content: "#!/bin/sh\nprintf 'plugin hook handler shell marker\\n'\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/output-styles/concise.md", content: "# Concise\n\nKeep output short.\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/settings.json", content: JSON.stringify({ safeMode: true, apiToken: "should-not-leak", nested: { password: "should-not-leak" } }, null, 2) }),
+  });
+  const pluginList = await request("/tools/plugin_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 10 }),
+  });
+  const listedPlugin = pluginList.payload?.data?.plugins?.find((plugin) => plugin?.name === "feature-dev");
+  assert(listedPlugin?.manifestType === "claude-plugin", "plugin_list should discover Claude-style workspace plugin manifests");
+  assert(listedPlugin?.commands?.includes(".oases/plugins/feature-dev/commands/feature-dev.md"), "plugin_list should summarize plugin commands");
+  assert(listedPlugin?.agents?.includes(".oases/plugins/feature-dev/agents/code-explorer.md"), "plugin_list should summarize plugin agents");
+  assert(listedPlugin?.skills?.includes(".oases/plugins/feature-dev/skills/review-helper/SKILL.md"), "plugin_list should summarize plugin skills");
+  assert(listedPlugin?.hooks?.includes(".oases/plugins/feature-dev/hooks/hooks.json"), "plugin_list should summarize plugin hooks");
+  assert(listedPlugin?.hooks?.includes(".oases/plugins/feature-dev/hooks-handlers/session-start.sh"), "plugin_list should summarize plugin hook handlers");
+  assert(listedPlugin?.outputStyles?.includes(".oases/plugins/feature-dev/output-styles/concise.md"), "plugin_list should summarize plugin output styles");
+  assert(listedPlugin?.settingsJson === ".oases/plugins/feature-dev/settings.json", "plugin_list should summarize plugin settings.json");
+  const pluginRead = await request("/tools/plugin_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "feature-dev", maxChars: 4000 }),
+  });
+  assert(pluginRead.payload?.data?.plugin?.name === "feature-dev", "plugin_read should read a workspace plugin by name");
+  assert(pluginRead.payload?.data?.readme?.includes("plugin readme marker"), "plugin_read should include README preview when present");
+  const pluginCapabilityList = await request("/tools/plugin_capability_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", maxResults: 10 }),
+  });
+  const listedCapability = pluginCapabilityList.payload?.data?.capabilities?.find((capability) => capability?.plugin === "feature-dev");
+  assert(listedCapability?.manifest?.mcpServerNames?.includes("docs"), "plugin_capability_list should summarize manifest MCP server names");
+  assert(listedCapability?.manifest?.lspServerNames?.includes("typescript"), "plugin_capability_list should summarize manifest LSP server names");
+  assert(listedCapability?.manifest?.settingsKeys?.includes("env"), "plugin_capability_list should summarize manifest settings keys");
+  assert(listedCapability?.manifest?.commandsMetadataNames?.includes("feature-dev"), "plugin_capability_list should summarize command metadata names");
+  assert(listedCapability?.manifest?.paths?.outputStyles?.includes("./output-styles"), "plugin_capability_list should summarize manifest output style paths");
+  assert(listedCapability?.files?.outputStyles?.includes(".oases/plugins/feature-dev/output-styles/concise.md"), "plugin_capability_list should summarize output style files");
+  const pluginCapabilityRead = await request("/tools/plugin_capability_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev" }),
+  });
+  assert(pluginCapabilityRead.payload?.data?.manifest?.mcpServers?.servers?.docs?.command === "node", "plugin_capability_read should summarize MCP server declarations");
+  assert(pluginCapabilityRead.payload?.data?.manifest?.settings?.values?.env?.values?.OASES_API_KEY?.redacted === true, "plugin_capability_read should redact sensitive manifest settings");
+  assert(pluginCapabilityRead.payload?.data?.settingsFile?.settings?.values?.apiToken?.redacted === true, "plugin_capability_read should redact sensitive settings.json keys");
+  assert(!JSON.stringify(pluginCapabilityRead.payload?.data || {}).includes("should-not-leak"), "plugin_capability_read should not expose sensitive setting values");
+  const pluginHookList = await request("/tools/plugin_hook_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", maxResults: 10 }),
+  });
+  const listedHookConfig = pluginHookList.payload?.data?.hooks?.find((hook) => hook?.path === ".oases/plugins/feature-dev/hooks/hooks.json");
+  assert(listedHookConfig?.kind === "config", "plugin_hook_list should classify hooks.json as config");
+  assert(listedHookConfig?.events?.includes("PreToolUse"), "plugin_hook_list should parse hook event names");
+  assert(listedHookConfig?.commands?.some((command) => command.includes("pretooluse.py")), "plugin_hook_list should summarize hook commands");
+  const listedHookHandler = pluginHookList.payload?.data?.hooks?.find((hook) => hook?.path === ".oases/plugins/feature-dev/hooks/pretooluse.py");
+  assert(listedHookHandler?.kind === "handler", "plugin_hook_list should classify hook scripts as handlers");
+  const listedHookHandlerShell = pluginHookList.payload?.data?.hooks?.find((hook) => hook?.path === ".oases/plugins/feature-dev/hooks-handlers/session-start.sh");
+  assert(listedHookHandlerShell?.kind === "handler", "plugin_hook_list should include hooks-handlers files");
+  const pluginHookRead = await request("/tools/plugin_hook_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "hooks", maxChars: 4000 }),
+  });
+  assert(pluginHookRead.payload?.data?.hook?.events?.includes("PreToolUse"), "plugin_hook_read should read a hook config by plugin/name");
+  assert(pluginHookRead.payload?.data?.events?.[0]?.matchers?.includes("Edit|Write"), "plugin_hook_read should expose hook matcher metadata");
+  const pluginHookHandlerRead = await request("/tools/plugin_hook_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/hooks/pretooluse.py", maxChars: 4000 }),
+  });
+  assert(pluginHookHandlerRead.payload?.data?.content?.includes("plugin hook handler marker"), "plugin_hook_read should read hook handler source without executing it");
+  const pluginHookHandlerShellRead = await request("/tools/plugin_hook_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/hooks-handlers/session-start.sh", maxChars: 4000 }),
+  });
+  assert(pluginHookHandlerShellRead.payload?.data?.content?.includes("plugin hook handler shell marker"), "plugin_hook_read should read hooks-handlers source files");
+  const pluginHookReadBlocked = await request("/tools/plugin_hook_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../package.json" }),
+  });
+  assert(pluginHookReadBlocked.response.status >= 400, "plugin_hook_read should reject paths outside .oases/plugins");
+  const pluginCommandList = await request("/tools/plugin_command_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", maxResults: 10 }),
+  });
+  const listedCommand = pluginCommandList.payload?.data?.commands?.find((command) => command?.name === "feature-dev");
+  assert(listedCommand?.path === ".oases/plugins/feature-dev/commands/feature-dev.md", "plugin_command_list should list plugin command markdown files");
+  assert(listedCommand?.title === "Feature command", "plugin_command_list should parse command headings");
+  assert(listedCommand?.description === "Build a feature safely", "plugin_command_list should parse command frontmatter");
+  const pluginCommandRead = await request("/tools/plugin_command_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "feature-dev", maxChars: 4000 }),
+  });
+  assert(pluginCommandRead.payload?.data?.command?.title === "Feature command", "plugin_command_read should read a command by plugin/name");
+  assert(pluginCommandRead.payload?.data?.body?.includes("Use a plan"), "plugin_command_read should return command body content");
+  const pluginCommandReadByPath = await request("/tools/plugin_command_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/commands/feature-dev.md", maxChars: 4000 }),
+  });
+  assert(pluginCommandReadByPath.payload?.data?.metadata?.description === "Build a feature safely", "plugin_command_read should read a command by relative path");
+  const pluginCommandReadBlocked = await request("/tools/plugin_command_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../package.json" }),
+  });
+  assert(pluginCommandReadBlocked.response.status >= 400, "plugin_command_read should reject paths outside .oases/plugins");
+  const pluginCommandInstall = await request("/tools/plugin_command_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "feature-dev", targetName: "feature-dev-local" }),
+  });
+  assert(pluginCommandInstall.payload?.data?.installed === true, "plugin_command_install should install a plugin command into .oases/commands");
+  assert(pluginCommandInstall.payload?.data?.path === ".oases/commands/feature-dev-local.md", "plugin_command_install should report installed workspace command path");
+  const installedCommandList = await request("/tools/command_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 100 }),
+  });
+  assert(installedCommandList.payload?.data?.commands?.some((command) => command?.path === ".oases/commands/feature-dev-local.md"), "command_list should include installed plugin commands");
+  const installedCommandRead = await request("/tools/command_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/commands/feature-dev-local.md", maxChars: 4000 }),
+  });
+  assert(installedCommandRead.payload?.data?.body?.includes("Use a plan"), "command_read should read installed plugin command body");
+  const duplicatePluginCommandInstall = await request("/tools/plugin_command_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "feature-dev", targetName: "feature-dev-local" }),
+  });
+  assert(duplicatePluginCommandInstall.response.status >= 400, "plugin_command_install should refuse to overwrite existing workspace commands");
+  const pluginAgentList = await request("/tools/plugin_agent_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", maxResults: 10 }),
+  });
+  const listedPluginAgent = pluginAgentList.payload?.data?.agents?.find((agent) => agent?.name === "code-explorer");
+  assert(listedPluginAgent?.path === ".oases/plugins/feature-dev/agents/code-explorer.md", "plugin_agent_list should list plugin agent markdown files");
+  assert(listedPluginAgent?.plugin === "feature-dev", "plugin_agent_list should label plugin agent source");
+  assert(listedPluginAgent?.agentType === "explore", "plugin_agent_list should parse agent frontmatter");
+  assert(listedPluginAgent?.tools?.includes("read_file") && listedPluginAgent?.skills?.includes("research"), "plugin_agent_list should parse plugin agent tool and skill metadata");
+  assert(String(listedPluginAgent?.initialPrompt || "").includes("then summarize"), "plugin_agent_list should parse plugin agent block initialPrompt");
+  const pluginAgentRead = await request("/tools/plugin_agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "code-explorer", maxChars: 4000 }),
+  });
+  assert(pluginAgentRead.payload?.data?.agent?.source === "plugin", "plugin_agent_read should mark plugin agent source");
+  assert(pluginAgentRead.payload?.data?.prompt?.includes("plugin agent marker"), "plugin_agent_read should return agent prompt body");
+  const pluginAgentReadByPath = await request("/tools/plugin_agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/agents/code-explorer.md", maxChars: 4000 }),
+  });
+  assert(pluginAgentReadByPath.payload?.data?.metadata?.description === "Explore code structure", "plugin_agent_read should read a plugin agent by relative path");
+  const pluginAgentReadBlocked = await request("/tools/plugin_agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../package.json" }),
+  });
+  assert(pluginAgentReadBlocked.response.status >= 400, "plugin_agent_read should reject paths outside .oases/plugins");
+  const pluginAgentInstall = await request("/tools/plugin_agent_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "code-explorer", targetName: "code-explorer-local" }),
+  });
+  assert(pluginAgentInstall.payload?.data?.installed === true, "plugin_agent_install should install a plugin agent into .oases/agents");
+  assert(pluginAgentInstall.payload?.data?.path === ".oases/agents/code-explorer-local.md", "plugin_agent_install should report installed workspace agent path");
+  const installedPluginAgentList = await request("/tools/agent_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 100 }),
+  });
+  assert(installedPluginAgentList.payload?.data?.agents?.some((agent) => agent?.name === "code-explorer" && agent?.path === ".oases/agents/code-explorer-local.md"), "agent_list should include installed plugin agents as workspace agents");
+  const installedPluginAgentRead = await request("/tools/agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/agents/code-explorer-local.md", maxChars: 4000 }),
+  });
+  assert(installedPluginAgentRead.payload?.data?.prompt?.includes("plugin agent marker"), "agent_read should read installed plugin agent prompt");
+  const duplicatePluginAgentInstall = await request("/tools/plugin_agent_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "code-explorer", targetName: "code-explorer-local" }),
+  });
+  assert(duplicatePluginAgentInstall.response.status >= 400, "plugin_agent_install should refuse to overwrite existing workspace agents");
+  const pluginSkillList = await request("/tools/plugin_skill_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", maxResults: 10 }),
+  });
+  const listedPluginSkill = pluginSkillList.payload?.data?.skills?.find((skill) => skill?.name === "review-helper");
+  assert(listedPluginSkill?.path === ".oases/plugins/feature-dev/skills/review-helper/SKILL.md", "plugin_skill_list should list plugin SKILL.md files");
+  assert(listedPluginSkill?.plugin === "feature-dev", "plugin_skill_list should label plugin skill source");
+  assert(listedPluginSkill?.description === "Review helper skill", "plugin_skill_list should parse skill frontmatter");
+  const pluginSkillRead = await request("/tools/plugin_skill_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "review-helper", maxChars: 4000 }),
+  });
+  assert(pluginSkillRead.payload?.data?.skill?.source === "plugin", "plugin_skill_read should mark plugin skill source");
+  assert(pluginSkillRead.payload?.data?.content?.includes("plugin skill marker"), "plugin_skill_read should return skill content");
+  const pluginSkillReadByPath = await request("/tools/plugin_skill_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/skills/review-helper/SKILL.md", maxChars: 4000 }),
+  });
+  assert(pluginSkillReadByPath.payload?.data?.metadata?.description === "Review helper skill", "plugin_skill_read should read a plugin skill by relative path");
+  const pluginSkillReadBlocked = await request("/tools/plugin_skill_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../package.json" }),
+  });
+  assert(pluginSkillReadBlocked.response.status >= 400, "plugin_skill_read should reject paths outside .oases/plugins");
+  const pluginSkillInstall = await request("/tools/plugin_skill_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "review-helper", targetName: "review-helper-local" }),
+  });
+  assert(pluginSkillInstall.payload?.data?.installed === true, "plugin_skill_install should install a plugin skill into .oases/skills");
+  assert(pluginSkillInstall.payload?.data?.path === ".oases/skills/review-helper-local/SKILL.md", "plugin_skill_install should report installed workspace skill path");
+  const installedPluginSkillRead = await request("/tools/skill_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/skills/review-helper-local/SKILL.md", maxChars: 4000 }),
+  });
+  assert(installedPluginSkillRead.payload?.data?.source === "workspace", "skill_read should read installed plugin skill as a workspace skill");
+  assert(installedPluginSkillRead.payload?.data?.content?.includes("plugin skill marker"), "plugin_skill_install should copy the plugin SKILL.md content");
+  const installedPluginSkillAsset = await request("/tools/skill_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/skills/review-helper-local/references/checklist.md", maxChars: 4000 }),
+  });
+  assert(installedPluginSkillAsset.payload?.data?.content?.includes("plugin asset reference marker"), "plugin_skill_install should copy plugin skill assets");
+  const duplicatePluginSkillInstall = await request("/tools/plugin_skill_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "review-helper", targetName: "review-helper-local" }),
+  });
+  assert(duplicatePluginSkillInstall.response.status >= 400, "plugin_skill_install should refuse to overwrite existing workspace skills");
+  const pluginAssetList = await request("/tools/plugin_asset_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", assetPath: "skills/review-helper", maxResults: 50 }),
+  });
+  assert(pluginAssetList.payload?.data?.assets?.some((asset) => asset?.path === "skills/review-helper/references/checklist.md"), "plugin_asset_list should list nested plugin skill references");
+  const pluginAssetRead = await request("/tools/plugin_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", assetPath: "skills/review-helper/references/checklist.md", maxChars: 4000 }),
+  });
+  assert(pluginAssetRead.payload?.data?.content?.includes("plugin asset reference marker"), "plugin_asset_read should read plugin reference assets");
+  const pluginScriptAssetRead = await request("/tools/plugin_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/scripts/check.sh", maxChars: 4000 }),
+  });
+  assert(pluginScriptAssetRead.payload?.data?.content?.includes("plugin asset script marker"), "plugin_asset_read should read plugin script assets without executing them");
+  const pluginAssetReadBlocked = await request("/tools/plugin_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", assetPath: "../package.json" }),
+  });
+  assert(pluginAssetReadBlocked.response.status >= 400, "plugin_asset_read should reject paths outside the selected plugin");
+  const pluginDisable = await request("/tools/plugin_disable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "feature-dev" }),
+  });
+  assert(pluginDisable.payload?.data?.enabled === false, "plugin_disable should mark a plugin disabled");
+  assert(pluginDisable.payload?.data?.markerPath === ".oases/plugins/feature-dev/.oases-disabled", "plugin_disable should report the marker path");
+  const disabledPluginList = await request("/tools/plugin_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 10 }),
+  });
+  const disabledPlugin = disabledPluginList.payload?.data?.plugins?.find((plugin) => plugin?.name === "feature-dev");
+  assert(disabledPlugin?.enabled === false && disabledPlugin?.disabled === true, "plugin_list should report disabled plugin state");
+  const disabledDefaultCommands = await request("/tools/plugin_command_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 50 }),
+  });
+  assert(!disabledDefaultCommands.payload?.data?.commands?.some((command) => command?.plugin === "feature-dev"), "plugin_command_list should hide disabled plugins by default");
+  const disabledIncludedCommands = await request("/tools/plugin_command_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ includeDisabled: true, maxResults: 50 }),
+  });
+  assert(disabledIncludedCommands.payload?.data?.commands?.some((command) => command?.plugin === "feature-dev"), "plugin_command_list includeDisabled should include disabled plugins");
+  const disabledDefaultHooks = await request("/tools/plugin_hook_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 50 }),
+  });
+  assert(!disabledDefaultHooks.payload?.data?.hooks?.some((hook) => hook?.plugin === "feature-dev"), "plugin_hook_list should hide disabled plugins by default");
+  const disabledIncludedHooks = await request("/tools/plugin_hook_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ includeDisabled: true, maxResults: 50 }),
+  });
+  assert(disabledIncludedHooks.payload?.data?.hooks?.some((hook) => hook?.plugin === "feature-dev"), "plugin_hook_list includeDisabled should include disabled plugins");
+  const disabledDefaultCapabilities = await request("/tools/plugin_capability_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 50 }),
+  });
+  assert(!disabledDefaultCapabilities.payload?.data?.capabilities?.some((capability) => capability?.plugin === "feature-dev"), "plugin_capability_list should hide disabled plugins by default");
+  const disabledIncludedCapabilities = await request("/tools/plugin_capability_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ includeDisabled: true, maxResults: 50 }),
+  });
+  assert(disabledIncludedCapabilities.payload?.data?.capabilities?.some((capability) => capability?.plugin === "feature-dev"), "plugin_capability_list includeDisabled should include disabled plugins");
+  const disabledCapabilityRead = await request("/tools/plugin_capability_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev" }),
+  });
+  assert(disabledCapabilityRead.response.status >= 400, "plugin_capability_read should hide disabled plugins by default");
+  const disabledIncludedCapabilityRead = await request("/tools/plugin_capability_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", includeDisabled: true }),
+  });
+  assert(disabledIncludedCapabilityRead.payload?.data?.capability?.disabled === true, "plugin_capability_read includeDisabled should read disabled plugins");
+  const pluginEnable = await request("/tools/plugin_enable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev" }),
+  });
+  assert(pluginEnable.payload?.data?.enabled === true, "plugin_enable should re-enable a disabled plugin");
+  const enabledPluginList = await request("/tools/plugin_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 10 }),
+  });
+  const enabledPlugin = enabledPluginList.payload?.data?.plugins?.find((plugin) => plugin?.name === "feature-dev");
+  assert(enabledPlugin?.enabled === true && enabledPlugin?.disabled === false, "plugin_list should report re-enabled plugin state");
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "plugin-sources/import-me/.claude-plugin/plugin.json", content: JSON.stringify({ name: "import-me", version: "0.0.1", description: "Imported plugin" }, null, 2) }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "plugin-sources/import-me/commands/import.md", content: "# Import command\n\nimport command marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "plugin-sources/import-me/scripts/import.sh", content: "#!/bin/sh\nprintf 'imported plugin script marker\\n'\n" }),
+  });
+  const pluginInstall = await request("/tools/plugin_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "plugin-sources/import-me", targetName: "imported-demo" }),
+  });
+  assert(pluginInstall.payload?.data?.installed === true, "plugin_install should install a workspace plugin source");
+  assert(pluginInstall.payload?.data?.path === ".oases/plugins/imported-demo/.claude-plugin/plugin.json", "plugin_install should report installed manifest path");
+  assert(pluginInstall.payload?.data?.plugin?.commands?.includes(".oases/plugins/imported-demo/commands/import.md"), "plugin_install should summarize installed plugin commands");
+  const installedPluginRead = await request("/tools/plugin_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "import-me", maxChars: 4000 }),
+  });
+  assert(installedPluginRead.payload?.data?.plugin?.root === ".oases/plugins/imported-demo", "plugin_read should read installed plugin by manifest name");
+  const installedPluginAsset = await request("/tools/plugin_asset_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "import-me", assetPath: "scripts/import.sh", maxChars: 4000 }),
+  });
+  assert(installedPluginAsset.payload?.data?.content?.includes("imported plugin script marker"), "plugin_install should copy plugin script assets");
+  const duplicatePluginInstall = await request("/tools/plugin_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "plugin-sources/import-me", targetName: "imported-demo" }),
+  });
+  assert(duplicatePluginInstall.response.status >= 400, "plugin_install should refuse to overwrite existing workspace plugins");
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/not-a-plugin/README.md", content: "# Not a plugin\n" }),
+  });
+  const pluginRemoveNonPlugin = await request("/tools/plugin_remove", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/not-a-plugin" }),
+  });
+  assert(pluginRemoveNonPlugin.response.status >= 400, "plugin_remove should reject directories without a plugin manifest");
+  const pluginRemoveBlocked = await request("/tools/plugin_remove", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../package.json" }),
+  });
+  assert(pluginRemoveBlocked.response.status >= 400, "plugin_remove should reject paths outside .oases/plugins");
+  const pluginRemove = await request("/tools/plugin_remove", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "import-me" }),
+  });
+  assert(pluginRemove.payload?.data?.removed === true, "plugin_remove should remove an installed plugin");
+  assert(pluginRemove.payload?.data?.path === ".oases/plugins/imported-demo", "plugin_remove should report the removed plugin directory");
+  const pluginListAfterRemove = await request("/tools/plugin_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 50 }),
+  });
+  assert(!pluginListAfterRemove.payload?.data?.plugins?.some((plugin) => plugin.root === ".oases/plugins/imported-demo"), "plugin_remove should remove the plugin from plugin_list");
+  const pluginReadBlocked = await request("/tools/plugin_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../package.json" }),
+  });
+  assert(pluginReadBlocked.response.status >= 400, "plugin_read should reject paths outside .oases/plugins");
 
   await request("/tools/write_file", {
     method: "POST",

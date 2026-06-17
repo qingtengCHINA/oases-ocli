@@ -100,6 +100,26 @@ Common npm commands:
 | Uninstall | `npm uninstall -g oases-ocli` |
 | Run without installing | `npx oases-ocli@latest` |
 
+If `npm publish --access public` fails with `E404 Not Found - PUT https://registry.npmjs.org/oases-ocli`, the package metadata is usually not the problem. It normally means the current terminal npm CLI is not authenticated as an account with publish permission for `oases-ocli`. Check the terminal account first:
+
+```bash
+npm whoami --registry=https://registry.npmjs.org/
+```
+
+It must print the maintainer account for the package, such as `qingtengpro`. If it prints `E401`, a different account, or nothing useful, log in again from the terminal:
+
+```bash
+npm logout --registry=https://registry.npmjs.org/
+npm login --registry=https://registry.npmjs.org/ --auth-type=web
+npm whoami --registry=https://registry.npmjs.org/
+```
+
+Then publish from this standalone package directory:
+
+```bash
+npm publish --access public
+```
+
 One-off usage without installing also works:
 
 ```bash
@@ -127,7 +147,22 @@ Then open Oases Chat Web in project mode. The Web app connects to `http://127.0.
 - Serve persisted session metadata and events through `GET /agent/sessions/:id` after an `ocli` restart.
 - Enrich session detail responses with `eventCounts`, `toolResults`, `artifacts`, `todos`, `approvalSummary`, and `resumePrompt` for Web timeline rendering and recovery.
 - Discover Oases skills with `skill_list`, read them with `skill_read`, and load them into the current agent session as skill context. Skills can come from the current workspace under `.oases/skills/<name>/SKILL.md` or from bundled package skills under `OcliSkills/<name>/SKILL.md`; results are labeled with `source: "workspace"` or `source: "bundled"`.
+- Read skill-owned resources with `skill_asset_list` and `skill_asset_read`. These read-only tools stay inside one selected skill directory and support references, scripts, evals, and examples without exposing arbitrary package or workspace paths. Script execution still goes through `run_python` or `run_command` and therefore keeps the existing command safety and approval flow.
+- Install bundled skills into the current project with `skill_install`. This copies a bundled skill directory into `.oases/skills/<targetName>` for project-level customization, refuses to overwrite existing workspace skills, and skips symlinks.
 - Ship bundled `OcliSkills` in the npm package so every user gets baseline skills such as `web-search`, `exa-search`, image helpers, data helpers, and platform-specific helpers immediately after `npm install -g oases-ocli`.
+- Discover workspace plugins with `plugin_list` and `plugin_read`. Plugin manifests live under `.oases/plugins/<plugin>/.oases-plugin/plugin.json` or Claude-style `.oases/plugins/<plugin>/.claude-plugin/plugin.json`; ocli summarizes README, commands, agents, and hooks so later phases can wire those plugin resources into the agent loop.
+- Discover and read workspace command templates with `command_list` and `command_read`. Command Markdown files live under `.oases/commands/*.md`; they are reusable project prompt templates and are not executed directly by these tools.
+- Discover, read, and install workspace plugin command templates with `plugin_command_list`, `plugin_command_read`, and `plugin_command_install`. Plugin command Markdown files live under `.oases/plugins/<plugin>/commands/*.md`; installing one copies it into `.oases/commands/<targetName>.md` so it becomes a normal project command template.
+- Discover and read workspace plugin hooks with `plugin_hook_list` and `plugin_hook_read`. Hook config and handler files live under `.oases/plugins/<plugin>/hooks` or `hooks-handlers`; ocli parses `hooks.json` event metadata and reads handler source without executing hook code.
+- Discover plugin manifest capabilities with `plugin_capability_list` and `plugin_capability_read`. These read-only tools summarize `mcpServers`, `lspServers`, manifest `settings`, custom component paths, `commandsMetadata`, `output-styles`, and `settings.json` structure without starting servers, applying settings, or executing plugin code. Sensitive setting keys such as tokens, secrets, API keys, passwords, and credentials are redacted by shape.
+- Discover and read workspace plugin agent definitions with `plugin_agent_list` and `plugin_agent_read`. Agent Markdown files live under `.oases/plugins/<plugin>/agents/*.md`; ocli parses the same frontmatter fields used by workspace custom agents while keeping this phase read-only.
+- Install plugin-provided agents into the current project with `plugin_agent_install`. This copies a selected plugin agent Markdown file into `.oases/agents/<targetName>.md`, where it becomes a normal workspace custom agent available through `agent_list`, `agent_read`, and `agent_run({ agentName })`.
+- Discover and read workspace plugin skill definitions with `plugin_skill_list` and `plugin_skill_read`. Skill Markdown files live under `.oases/plugins/<plugin>/skills/*/SKILL.md`; ocli parses skill frontmatter while keeping plugin skills separate from global `skill_list` until install/injection rules are implemented.
+- Install plugin-provided skills into the current project with `plugin_skill_install`. This copies the selected plugin skill directory into `.oases/skills/<targetName>`, including `SKILL.md` and skill-owned resources, so it becomes a normal workspace skill available through `skill_read` and `skill_asset_read`.
+- List and read plugin-owned resources with `plugin_asset_list` and `plugin_asset_read`. These tools stay realpath-confined to one selected plugin directory and can read references, scripts, examples, hooks, commands, agents, and skills as text without executing plugin files.
+- Install workspace-local plugin directories with `plugin_install`. The source must be inside the current workspace and contain `.oases-plugin/plugin.json` or `.claude-plugin/plugin.json`; ocli copies it into `.oases/plugins/<targetName>`, refuses to overwrite existing plugins, and skips `.git`, `node_modules`, `.DS_Store`, and symlinks.
+- Remove installed workspace plugins with `plugin_remove`. The target must stay under `.oases/plugins`, contain `.oases-plugin/plugin.json` or `.claude-plugin/plugin.json`, and is treated as a destructive operation that requires approval inside agent sessions.
+- Disable or re-enable installed plugins with `plugin_disable` and `plugin_enable`. Disabled plugins keep their files but receive a `.oases-disabled` marker; `plugin_list` reports `enabled` / `disabled`, while command, agent, and skill discovery hide disabled plugins unless `includeDisabled: true` is provided.
 - Discover workspace-local custom agents with `agent_list`, read them with `agent_read`, and run them through `agent_run({ agentName })`. Custom agent Markdown files live under `.oases/agents`, can provide frontmatter defaults such as `agentType`, `maxTurns`, `background`, `isolation`, `effort`, and `initialPrompt`, and inject their body as sub-agent instructions. Their `tools` and `disallowedTools` frontmatter scopes the sub-agent tool schema and is enforced again before tool execution, so text tool blocks cannot bypass the custom agent boundary. Their `skills` frontmatter preloads matching `.oases/skills` or bundled `OcliSkills` into the sub-agent's first turn and records those skills in session audit metadata. Their `initialPrompt` frontmatter is prepended to the sub-agent's first user turn and preserved in `agent_run` result metadata. Their `effort` frontmatter can set `low`, `medium`, `high`, or `max` for that sub-agent request without changing the Web-owned model/API. Agent frontmatter supports comma-separated lists, YAML `- item` lists, and `initialPrompt: |` block scalars for multi-line first-turn seeding.
 
 ## Migration Direction

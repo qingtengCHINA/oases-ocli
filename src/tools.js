@@ -25,11 +25,16 @@ const TYPE_EXTENSIONS = {
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(MODULE_DIR, "..");
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, "..");
+const SENSITIVE_KEY_RE = /(?:token|secret|key|password|credential|authorization|auth|api[_-]?key)/i;
 
 function truncateText(text, limit) {
   const value = String(text || "");
   if (value.length <= limit) return { text: value, truncated: false };
   return { text: `${value.slice(0, limit)}\n\n[truncated ${value.length - limit} chars]`, truncated: true };
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function fileArtifact(filePath, info, role = "output") {
@@ -730,6 +735,15 @@ function skillRecordFromMetadata(file, metadata = {}) {
   };
 }
 
+function normalizeSkillAssetPath(value, fallback = ".") {
+  const normalized = String(value || fallback).trim().replace(/\\+/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized === ".") return ".";
+  if (path.isAbsolute(normalized) || normalized === ".." || normalized.includes("../")) {
+    throw new Error("Skill asset path must stay inside the selected skill directory.");
+  }
+  return normalized;
+}
+
 async function listSkills(root, body = {}) {
   const maxResults = Math.max(1, Math.min(500, Number(body.maxResults) || 80));
   const workspaceFiles = await walkSkillFiles(root, maxResults * 4);
@@ -756,15 +770,17 @@ async function listSkills(root, body = {}) {
   };
 }
 
-async function readSkill(root, body = {}) {
-  const requested = String(body.path || body.name || "").trim();
-  if (!requested) throw new Error("skill_read requires path or name.");
+async function findSkillByRequest(root, requested) {
   const skills = await listSkills(root, { maxResults: 500 });
   const requestedLower = requested.toLowerCase();
-  const matched = skills.skills.find((skill) => skill.name === requested || skill.id === requested || skill.path === requested)
+  return skills.skills.find((skill) => skill.name === requested || skill.id === requested || skill.path === requested)
     || skills.skills.find((skill) => skill.name.toLowerCase() === requestedLower || skill.id.toLowerCase() === requestedLower || skill.path.toLowerCase() === requestedLower);
+}
+
+async function resolveSkillTarget(root, requested) {
+  const matched = await findSkillByRequest(root, requested);
   const skillPath = matched ? matched.path : requested;
-  const normalized = skillPath.replace(/^\.\//, "").replace(/\\+/g, "/");
+  const normalized = normalizeSkillAssetPath(skillPath);
   if (normalized.includes("../") || path.isAbsolute(normalized)) {
     throw new Error("skill_read can only read files under .oases/skills or bundled OcliSkills.");
   }
@@ -788,6 +804,13 @@ async function readSkill(root, body = {}) {
   } else {
     throw new Error("skill_read can only read files under .oases/skills or bundled OcliSkills.");
   }
+  return { matched, normalized, target, source, rootLabel };
+}
+
+async function readSkill(root, body = {}) {
+  const requested = String(body.path || body.name || "").trim();
+  if (!requested) throw new Error("skill_read requires path or name.");
+  const { matched, normalized, target, source, rootLabel } = await resolveSkillTarget(root, requested);
   if (!/(^|\/)SKILL\.md$/i.test(normalized)) throw new Error("skill_read can only read SKILL.md files.");
   const info = await stat(target);
   if (!info.isFile()) throw new Error("skill_read target is not a file.");
@@ -811,6 +834,1252 @@ async function readSkill(root, body = {}) {
     content: preview.text,
     truncated: preview.truncated,
     skill,
+  };
+}
+
+async function resolveSkillAssetTarget(root, body = {}, { requireFile = false } = {}) {
+  const skillName = String(body.name || body.skill || "").trim();
+  const directPath = String(body.path || "").trim();
+  const requestedAssetPath = String(body.assetPath || body.file || "").trim();
+  let skill;
+  let relativeAssetPath;
+
+  if (skillName) {
+    skill = await findSkillByRequest(root, skillName);
+    if (!skill) throw new Error(`Skill not found: ${skillName}`);
+    relativeAssetPath = normalizeSkillAssetPath(requestedAssetPath || directPath || ".");
+  } else if (directPath) {
+    const normalized = normalizeSkillAssetPath(directPath);
+    const skills = await listSkills(root, { maxResults: 500 });
+    skill = skills.skills
+      .map((item) => ({ ...item, skillDirPath: item.path.replace(/\/SKILL\.md$/i, "") }))
+      .sort((a, b) => b.skillDirPath.length - a.skillDirPath.length)
+      .find((item) => normalized === item.skillDirPath || normalized.startsWith(`${item.skillDirPath}/`));
+    if (!skill) throw new Error("skill_asset_read path must be inside a known .oases/skills or OcliSkills skill directory.");
+    const skillDirPath = skill.path.replace(/\/SKILL\.md$/i, "");
+    relativeAssetPath = normalizeSkillAssetPath(normalized === skillDirPath ? "." : normalized.slice(skillDirPath.length + 1));
+  } else {
+    throw new Error("skill asset tools require name/skill or path.");
+  }
+
+  const baseDir = await realpath(skill.baseDir);
+  const target = path.resolve(baseDir, relativeAssetPath === "." ? "" : relativeAssetPath);
+  const resolvedTarget = await realpath(target).catch(() => target);
+  if (!isPathInside(baseDir, resolvedTarget)) throw new Error("Skill asset path escapes the selected skill directory.");
+  const info = await stat(resolvedTarget);
+  if (requireFile && !info.isFile()) throw new Error("skill_asset_read target is not a file.");
+  const skillDirPath = skill.path.replace(/\/SKILL\.md$/i, "");
+  return {
+    skill,
+    source: skill.source,
+    root: skill.root,
+    baseDir,
+    relativeAssetPath,
+    target: resolvedTarget,
+    info,
+    path: relativeAssetPath === "." ? skillDirPath : `${skillDirPath}/${relativeAssetPath}`,
+  };
+}
+
+async function listSkillAssets(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(500, Number(body.maxResults) || 100));
+  const resolved = await resolveSkillAssetTarget(root, body);
+  if (!resolved.info.isDirectory()) throw new Error("skill_asset_list target is not a directory.");
+  const assets = [];
+  async function visit(directory) {
+    if (assets.length >= maxResults) return;
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (assets.length >= maxResults) return;
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const realAbsolute = await realpath(absolute).catch(() => absolute);
+      if (!isPathInside(resolved.baseDir, realAbsolute)) continue;
+      const relativePath = path.relative(resolved.baseDir, realAbsolute).replace(/\\+/g, "/");
+      const info = await stat(realAbsolute).catch(() => undefined);
+      if (entry.isDirectory()) {
+        assets.push({ type: "dir", path: relativePath });
+        await visit(realAbsolute);
+      } else if (entry.isFile()) {
+        assets.push({ type: "file", path: relativePath, bytes: info?.size, extension: path.extname(relativePath).toLowerCase() || undefined });
+      }
+    }
+  }
+  await visit(resolved.target);
+  return {
+    skill: resolved.skill,
+    source: resolved.source,
+    root: resolved.root,
+    baseDir: resolved.baseDir,
+    path: resolved.path,
+    assets,
+    count: assets.length,
+    truncated: assets.length >= maxResults,
+  };
+}
+
+async function readSkillAsset(root, body = {}) {
+  const resolved = await resolveSkillAssetTarget(root, body, { requireFile: true });
+  if (resolved.info.size > 512 * 1024) throw new Error("skill_asset_read target is too large.");
+  const content = await readFile(resolved.target, "utf8");
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  return {
+    skill: resolved.skill,
+    source: resolved.source,
+    root: resolved.root,
+    baseDir: resolved.baseDir,
+    path: resolved.path,
+    assetPath: resolved.relativeAssetPath,
+    bytes: resolved.info.size,
+    content: preview.text,
+    truncated: preview.truncated,
+  };
+}
+
+function normalizeInstallName(value, toolName = "skill_install") {
+  const normalized = String(value || "").trim().replace(/\\+/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized.includes("/") || normalized === "." || normalized === ".." || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error(`${toolName} targetName must be a single safe directory name.`);
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(normalized)) throw new Error(`${toolName} targetName may only contain letters, numbers, dot, underscore, or dash.`);
+  return normalized;
+}
+
+async function directoryExists(target) {
+  try {
+    const info = await stat(target);
+    return info.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function fileExists(target) {
+  try {
+    const info = await stat(target);
+    return info.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function copySkillDirectory(sourceDir, targetDir, sourceRoot) {
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+  await mkdir(targetDir, { recursive: true });
+  for (const entry of entries) {
+    if (entry.name === ".DS_Store") continue;
+    const source = path.join(sourceDir, entry.name);
+    const realSource = await realpath(source).catch(() => source);
+    if (!isPathInside(sourceRoot, realSource)) throw new Error("Bundled skill source escapes its directory.");
+    const target = path.join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      await copySkillDirectory(realSource, target, sourceRoot);
+    } else if (entry.isFile()) {
+      await copyFile(realSource, target);
+    }
+  }
+}
+
+async function copySafeDirectory(sourceDir, targetDir, sourceRoot, label = "source") {
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+  await mkdir(targetDir, { recursive: true });
+  for (const entry of entries) {
+    if (entry.name === ".DS_Store" || entry.name === ".git" || entry.name === "node_modules") continue;
+    const source = path.join(sourceDir, entry.name);
+    const realSource = await realpath(source).catch(() => source);
+    if (!isPathInside(sourceRoot, realSource)) throw new Error(`${label} escapes its directory.`);
+    const target = path.join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      await copySafeDirectory(realSource, target, sourceRoot, label);
+    } else if (entry.isFile()) {
+      await copyFile(realSource, target);
+    }
+  }
+}
+
+async function installSkill(root, body = {}) {
+  const requested = String(body.name || body.skill || "").trim();
+  if (!requested) throw new Error("skill_install requires a bundled skill name.");
+  const skills = await listSkills(root, { maxResults: 500 });
+  const requestedLower = requested.toLowerCase();
+  const sourceSkill = skills.skills.find((skill) => skill.source === "bundled" && (skill.name === requested || skill.id === requested || skill.path === requested))
+    || skills.skills.find((skill) => skill.source === "bundled" && (skill.name.toLowerCase() === requestedLower || skill.id.toLowerCase() === requestedLower || skill.path.toLowerCase() === requestedLower));
+  if (!sourceSkill) throw new Error(`Bundled skill not found: ${requested}`);
+  const defaultName = path.basename(path.dirname(sourceSkill.path));
+  const targetName = normalizeInstallName(body.targetName || defaultName);
+  const targetRelativeDir = `.oases/skills/${targetName}`;
+  const parent = workspacePath(root, ".oases/skills");
+  await mkdir(parent, { recursive: true });
+  const targetDir = workspacePath(root, targetRelativeDir);
+  if (await directoryExists(targetDir)) throw new Error(`Workspace skill already exists: ${targetRelativeDir}`);
+  const sourceDir = await realpath(sourceSkill.baseDir);
+  const sourceRoot = await realpath(sourceDir);
+  await copySkillDirectory(sourceDir, targetDir, sourceRoot);
+  const installedSkillPath = `${targetRelativeDir}/SKILL.md`;
+  const installedInfo = await stat(workspacePath(root, installedSkillPath));
+  return {
+    installed: true,
+    name: targetName,
+    sourceSkill,
+    path: installedSkillPath,
+    targetDir: targetRelativeDir,
+    bytes: installedInfo.size,
+    artifacts: [{ type: "file", role: "installed_skill", path: installedSkillPath, bytes: installedInfo.size }],
+  };
+}
+
+async function findPluginManifestInDirectory(directory) {
+  for (const relative of PLUGIN_MANIFEST_PATHS) {
+    const target = path.join(directory, relative);
+    try {
+      const info = await stat(target);
+      if (!info.isFile() || info.size > 512 * 1024) continue;
+      const content = await readFile(target, "utf8");
+      return { path: relative, manifest: JSON.parse(content), bytes: info.size };
+    } catch {
+      // Try the next supported manifest location.
+    }
+  }
+  return undefined;
+}
+
+async function installPlugin(root, body = {}) {
+  const requested = String(body.path || body.sourcePath || body.source || "").trim();
+  if (!requested) throw new Error("plugin_install requires a source plugin directory path.");
+  const sourcePath = workspacePath(root, requested);
+  const sourceInfo = await stat(sourcePath);
+  if (!sourceInfo.isDirectory()) throw new Error("plugin_install source path must be a directory.");
+  const sourceRoot = await realpath(sourcePath);
+  const manifestInfo = await findPluginManifestInDirectory(sourceRoot);
+  if (!manifestInfo) throw new Error("plugin_install source must contain .oases-plugin/plugin.json or .claude-plugin/plugin.json.");
+  const defaultName = path.basename(sourceRoot);
+  const targetName = normalizeInstallName(body.targetName || defaultName, "plugin_install");
+  const targetRelativeDir = `.oases/plugins/${targetName}`;
+  const parent = workspacePath(root, ".oases/plugins");
+  await mkdir(parent, { recursive: true });
+  const targetDir = workspacePath(root, targetRelativeDir);
+  if (await directoryExists(targetDir)) throw new Error(`Workspace plugin already exists: ${targetRelativeDir}`);
+  await copySafeDirectory(sourceRoot, targetDir, sourceRoot, "Plugin source");
+  const installedManifestPath = `${targetRelativeDir}/${manifestInfo.path}`.replace(/\\+/g, "/");
+  const installedInfo = await stat(workspacePath(root, installedManifestPath));
+  const summary = await summarizePluginFiles(root, targetRelativeDir);
+  const plugin = normalizePluginMetadata(installedManifestPath, manifestInfo.manifest, summary);
+  return {
+    installed: true,
+    name: targetName,
+    sourcePath: workspaceRelativePath(root, sourcePath),
+    path: installedManifestPath,
+    targetDir: targetRelativeDir,
+    bytes: installedInfo.size,
+    manifest: manifestInfo.manifest,
+    plugin,
+    artifacts: [{ type: "file", role: "installed_plugin_manifest", path: installedManifestPath, bytes: installedInfo.size }],
+  };
+}
+
+const PLUGIN_MANIFEST_PATHS = [".oases-plugin/plugin.json", ".claude-plugin/plugin.json"];
+const PLUGIN_DISABLED_MARKER = ".oases-disabled";
+
+function normalizePluginRootPath(value, toolName = "plugin_remove") {
+  const normalized = String(value || "").trim().replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized || normalized === "." || normalized === ".." || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error(`${toolName} path must stay inside .oases/plugins.`);
+  }
+  if (!normalized.startsWith(".oases/plugins/")) {
+    throw new Error(`${toolName} can only target installed plugins under .oases/plugins.`);
+  }
+  const manifestSuffix = PLUGIN_MANIFEST_PATHS.find((suffix) => normalized.endsWith(`/${suffix}`));
+  const pluginRoot = manifestSuffix ? normalized.slice(0, -manifestSuffix.length - 1) : normalized;
+  if (!pluginRoot || pluginRoot === ".oases/plugins" || pluginRoot === ".oases/plugins/") {
+    throw new Error(`${toolName} requires a specific plugin directory.`);
+  }
+  return pluginRoot.replace(/\/+$/, "");
+}
+
+async function resolveInstalledPlugin(root, body = {}, toolName = "plugin_remove") {
+  const requested = String(body.name || body.plugin || body.path || "").trim();
+  if (!requested) throw new Error(`${toolName} requires name, plugin, or path.`);
+  const matched = await findPluginByRequest(root, requested);
+  const pluginRoot = matched ? matched.root : normalizePluginRootPath(requested, toolName);
+  const normalizedRoot = normalizePluginRootPath(pluginRoot, toolName);
+  const pluginsBase = await realpath(workspacePath(root, ".oases/plugins"));
+  const targetDir = workspacePath(root, normalizedRoot);
+  const resolvedTarget = await realpath(targetDir);
+  if (!isPathInside(pluginsBase, resolvedTarget)) throw new Error(`${toolName} target escapes .oases/plugins.`);
+  const info = await stat(resolvedTarget);
+  if (!info.isDirectory()) throw new Error(`${toolName} target must be a plugin directory.`);
+  const manifestInfo = await findPluginManifestInDirectory(resolvedTarget);
+  if (!manifestInfo) throw new Error(`${toolName} target must contain .oases-plugin/plugin.json or .claude-plugin/plugin.json.`);
+  const summary = await summarizePluginFiles(root, normalizedRoot);
+  const manifestPath = `${normalizedRoot}/${manifestInfo.path}`.replace(/\\+/g, "/");
+  const plugin = matched ? { ...matched, ...normalizePluginMetadata(manifestPath, manifestInfo.manifest, summary) } : normalizePluginMetadata(manifestPath, manifestInfo.manifest, summary);
+  return { plugin, manifest: manifestInfo.manifest, manifestPath, targetDir, normalizedRoot };
+}
+
+async function removePlugin(root, body = {}) {
+  const resolved = await resolveInstalledPlugin(root, body, "plugin_remove");
+  await rm(resolved.targetDir, { recursive: true, force: false });
+  return {
+    removed: true,
+    name: resolved.plugin.name,
+    path: resolved.normalizedRoot,
+    manifestPath: resolved.manifestPath,
+    manifest: resolved.manifest,
+    plugin: resolved.plugin,
+    artifacts: [{ type: "file", role: "removed_plugin", path: resolved.normalizedRoot }],
+  };
+}
+
+async function setPluginEnabled(root, body = {}, enabled = true) {
+  const toolName = enabled ? "plugin_enable" : "plugin_disable";
+  const resolved = await resolveInstalledPlugin(root, body, toolName);
+  const markerPath = path.join(resolved.targetDir, PLUGIN_DISABLED_MARKER);
+  if (enabled) {
+    await rm(markerPath, { force: true });
+  } else {
+    await writeFile(markerPath, JSON.stringify({
+      disabled: true,
+      plugin: resolved.plugin.name,
+      disabledAt: new Date().toISOString(),
+    }, null, 2), "utf8");
+  }
+  const summary = await summarizePluginFiles(root, resolved.normalizedRoot);
+  const plugin = normalizePluginMetadata(resolved.manifestPath, resolved.manifest, summary);
+  return {
+    enabled,
+    disabled: !enabled,
+    name: plugin.name,
+    path: resolved.normalizedRoot,
+    markerPath: `${resolved.normalizedRoot}/${PLUGIN_DISABLED_MARKER}`,
+    manifestPath: resolved.manifestPath,
+    manifest: resolved.manifest,
+    plugin,
+    artifacts: [{ type: "file", role: enabled ? "enabled_plugin" : "disabled_plugin", path: `${resolved.normalizedRoot}/${PLUGIN_DISABLED_MARKER}` }],
+  };
+}
+
+function normalizePluginFileId(file) {
+  return path.basename(path.dirname(path.dirname(file)));
+}
+
+function normalizePluginMetadata(file, metadata = {}, summary = {}) {
+  const fallbackId = normalizePluginFileId(file);
+  const name = typeof metadata.name === "string" && metadata.name ? metadata.name : fallbackId;
+  return {
+    id: name,
+    name,
+    version: typeof metadata.version === "string" ? metadata.version : "",
+    description: typeof metadata.description === "string" ? metadata.description : "",
+    path: file,
+    root: path.dirname(path.dirname(file)).replace(/\\+/g, "/"),
+    manifestType: file.includes("/.claude-plugin/") ? "claude-plugin" : "oases-plugin",
+    ...(metadata.author ? { author: metadata.author } : {}),
+    commands: summary.commands || [],
+    agents: summary.agents || [],
+    skills: summary.skills || [],
+    hooks: summary.hooks || [],
+    outputStyles: summary.outputStyles || [],
+    settingsJson: summary.settingsJson || "",
+    readme: summary.readme || "",
+    enabled: summary.disabled !== true,
+    disabled: summary.disabled === true,
+    ...(summary.disabled ? { disabledPath: `${path.dirname(path.dirname(file)).replace(/\\+/g, "/")}/${PLUGIN_DISABLED_MARKER}` } : {}),
+  };
+}
+
+async function summarizePluginFiles(root, pluginRoot) {
+  const commands = [];
+  const agents = [];
+  const skills = [];
+  const hooks = [];
+  const outputStyles = [];
+  let readme = "";
+  let settingsJson = "";
+  async function collect(folder, output, matcher = /\.md$/i) {
+    const target = path.join(root, pluginRoot, folder);
+    let entries;
+    try {
+      entries = await readdir(target, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.name.startsWith(".") || !matcher.test(entry.name)) continue;
+      output.push(`${pluginRoot}/${folder}/${entry.name}`.replace(/\\+/g, "/"));
+    }
+  }
+  async function collectSkills(directory) {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) {
+        await collectSkills(absolute);
+      } else if (entry.isFile() && /^SKILL\.md$/i.test(entry.name)) {
+        skills.push(relative);
+      }
+    }
+  }
+  await collect("commands", commands);
+  await collect("agents", agents);
+  await collectSkills(path.join(root, pluginRoot, "skills"));
+  await collect("hooks", hooks, /\.(json|js|mjs|cjs|py|sh)$/i);
+  await collect("hooks-handlers", hooks, /\.(json|js|mjs|cjs|py|sh)$/i);
+  await collect("output-styles", outputStyles, /\.(md|json)$/i);
+  for (const candidate of ["README.md", "readme.md"]) {
+    const file = `${pluginRoot}/${candidate}`;
+    try {
+      const info = await stat(workspacePath(root, file));
+      if (info.isFile()) {
+        readme = file;
+        break;
+      }
+    } catch {
+      // Ignore missing README files.
+    }
+  }
+  try {
+    const settingsPath = `${pluginRoot}/settings.json`;
+    const info = await stat(workspacePath(root, settingsPath));
+    if (info.isFile()) settingsJson = settingsPath;
+  } catch {
+    settingsJson = "";
+  }
+  let disabled = false;
+  try {
+    const info = await stat(workspacePath(root, `${pluginRoot}/${PLUGIN_DISABLED_MARKER}`));
+    disabled = info.isFile();
+  } catch {
+    disabled = false;
+  }
+  return { commands, agents, skills, hooks, outputStyles, readme, settingsJson, disabled };
+}
+
+function summarizeValueShape(value, key = "") {
+  const type = Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
+  if (SENSITIVE_KEY_RE.test(String(key || ""))) return { type, redacted: true };
+  if (Array.isArray(value)) {
+    return { type, length: value.length };
+  }
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort();
+    return {
+      type,
+      keys,
+      values: Object.fromEntries(keys.slice(0, 50).map((childKey) => [childKey, summarizeValueShape(value[childKey], childKey)])),
+      truncated: keys.length > 50,
+    };
+  }
+  return { type };
+}
+
+function summarizeSettingsShape(settings) {
+  if (!isPlainObject(settings)) return { count: 0, keys: [], values: {}, type: Array.isArray(settings) ? "array" : typeof settings };
+  const keys = Object.keys(settings).sort();
+  return {
+    count: keys.length,
+    keys,
+    values: Object.fromEntries(keys.slice(0, 80).map((key) => [key, summarizeValueShape(settings[key], key)])),
+    truncated: keys.length > 80,
+  };
+}
+
+function summarizeServerMap(value) {
+  if (!isPlainObject(value)) return { count: 0, names: [], servers: {} };
+  const names = Object.keys(value).sort();
+  const servers = {};
+  for (const name of names.slice(0, 80)) {
+    const server = value[name];
+    if (!isPlainObject(server)) {
+      servers[name] = { type: Array.isArray(server) ? "array" : typeof server };
+      continue;
+    }
+    const env = isPlainObject(server.env) ? server.env : undefined;
+    servers[name] = {
+      command: typeof server.command === "string" ? server.command : undefined,
+      transport: typeof server.transport === "string" ? server.transport : undefined,
+      url: typeof server.url === "string" ? server.url : undefined,
+      argsCount: Array.isArray(server.args) ? server.args.length : 0,
+      envKeys: env ? Object.keys(env).sort() : [],
+      keys: Object.keys(server).sort(),
+    };
+  }
+  return { count: names.length, names, servers, truncated: names.length > 80 };
+}
+
+function summarizeCommandsMetadata(value) {
+  if (!isPlainObject(value)) return { count: 0, names: [], commands: {} };
+  const names = Object.keys(value).sort();
+  const commands = {};
+  for (const name of names.slice(0, 100)) {
+    const metadata = value[name];
+    if (!isPlainObject(metadata)) {
+      commands[name] = { type: Array.isArray(metadata) ? "array" : typeof metadata };
+      continue;
+    }
+    commands[name] = {
+      description: typeof metadata.description === "string" ? metadata.description : "",
+      allowedTools: Array.isArray(metadata.allowedTools) ? metadata.allowedTools.filter((item) => typeof item === "string") : [],
+      argumentHint: typeof metadata.argumentHint === "string" ? metadata.argumentHint : "",
+      keys: Object.keys(metadata).sort(),
+    };
+  }
+  return { count: names.length, names, commands, truncated: names.length > 100 };
+}
+
+function normalizeManifestPathList(value) {
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+}
+
+function summarizeManifestPaths(manifest = {}) {
+  return {
+    commands: [...normalizeManifestPathList(manifest.commandsPath), ...normalizeManifestPathList(manifest.commandsPaths)],
+    agents: [...normalizeManifestPathList(manifest.agentsPath), ...normalizeManifestPathList(manifest.agentsPaths)],
+    skills: [...normalizeManifestPathList(manifest.skillsPath), ...normalizeManifestPathList(manifest.skillsPaths)],
+    outputStyles: [...normalizeManifestPathList(manifest.outputStylesPath), ...normalizeManifestPathList(manifest.outputStylesPaths)],
+  };
+}
+
+function summarizePluginCapability(plugin, manifest = {}, summary = {}) {
+  const mcpServers = summarizeServerMap(manifest.mcpServers);
+  const lspServers = summarizeServerMap(manifest.lspServers);
+  const settings = summarizeSettingsShape(manifest.settings);
+  const commandsMetadata = summarizeCommandsMetadata(manifest.commandsMetadata);
+  const manifestPaths = summarizeManifestPaths(manifest);
+  return {
+    plugin: plugin.name,
+    id: plugin.id,
+    root: plugin.root,
+    path: plugin.path,
+    enabled: plugin.enabled !== false,
+    disabled: plugin.disabled === true,
+    manifestType: plugin.manifestType,
+    manifest: {
+      mcpServers: mcpServers.count,
+      mcpServerNames: mcpServers.names,
+      lspServers: lspServers.count,
+      lspServerNames: lspServers.names,
+      settings: settings.count,
+      settingsKeys: settings.keys,
+      commandsMetadata: commandsMetadata.count,
+      commandsMetadataNames: commandsMetadata.names,
+      paths: manifestPaths,
+    },
+    files: {
+      commands: summary.commands || plugin.commands || [],
+      agents: summary.agents || plugin.agents || [],
+      skills: summary.skills || plugin.skills || [],
+      hooks: summary.hooks || plugin.hooks || [],
+      outputStyles: summary.outputStyles || plugin.outputStyles || [],
+      readme: summary.readme || plugin.readme || "",
+      settingsJson: summary.settingsJson || plugin.settingsJson || "",
+    },
+  };
+}
+
+async function readPluginSettingsSummary(root, settingsPath) {
+  if (!settingsPath) return undefined;
+  try {
+    const target = workspacePath(root, settingsPath);
+    const info = await stat(target);
+    if (!info.isFile()) return undefined;
+    if (info.size > 512 * 1024) return { path: settingsPath, bytes: info.size, tooLarge: true };
+    const content = await readFile(target, "utf8");
+    return { path: settingsPath, bytes: info.size, settings: summarizeSettingsShape(JSON.parse(content)) };
+  } catch (error) {
+    return { path: settingsPath, error: error?.message || String(error) };
+  }
+}
+
+async function listPluginCapabilities(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const requested = String(body.plugin || body.name || body.path || "").trim();
+  const requestedLower = requested.toLowerCase();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const filtered = plugins.plugins
+    .filter((plugin) => body.includeDisabled === true || plugin.disabled !== true)
+    .filter((plugin) => !requested || matchesPluginRequest(plugin, requested, requestedLower))
+    .slice(0, maxResults);
+  const capabilities = [];
+  for (const plugin of filtered) {
+    try {
+      const manifest = JSON.parse(await readFile(workspacePath(root, plugin.path), "utf8"));
+      const summary = await summarizePluginFiles(root, plugin.root);
+      capabilities.push(summarizePluginCapability(plugin, manifest, summary));
+    } catch {
+      // Ignore unreadable manifests after plugin_list already filtered them.
+    }
+  }
+  capabilities.sort((a, b) => a.plugin.localeCompare(b.plugin) || a.path.localeCompare(b.path));
+  return {
+    capabilities,
+    count: capabilities.length,
+    root: ".oases/plugins",
+    includeDisabled: body.includeDisabled === true,
+    truncated: filtered.length >= maxResults,
+  };
+}
+
+async function readPluginCapability(root, body = {}) {
+  const requested = String(body.plugin || body.name || body.path || "").trim();
+  if (!requested) throw new Error("plugin_capability_read requires plugin, name, or path.");
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const plugin = plugins.plugins.find((item) => matchesPluginRequest(item, requested, requestedLower));
+  if (!plugin) throw new Error(`Plugin not found: ${requested}`);
+  if (plugin.disabled === true && body.includeDisabled !== true) {
+    throw new Error("plugin_capability_read skips disabled plugins unless includeDisabled is true.");
+  }
+  const content = await readFile(workspacePath(root, plugin.path), "utf8");
+  const manifest = JSON.parse(content);
+  const summary = await summarizePluginFiles(root, plugin.root);
+  const capability = summarizePluginCapability(plugin, manifest, summary);
+  const mcpServers = summarizeServerMap(manifest.mcpServers);
+  const lspServers = summarizeServerMap(manifest.lspServers);
+  const settings = summarizeSettingsShape(manifest.settings);
+  const commandsMetadata = summarizeCommandsMetadata(manifest.commandsMetadata);
+  const settingsFile = await readPluginSettingsSummary(root, summary.settingsJson);
+  return {
+    plugin,
+    capability,
+    manifest: {
+      paths: summarizeManifestPaths(manifest),
+      mcpServers,
+      lspServers,
+      settings,
+      commandsMetadata,
+    },
+    ...(settingsFile ? { settingsFile } : {}),
+  };
+}
+
+async function walkPluginManifestFiles(root, maxResults = 100) {
+  const pluginsRoot = path.join(root, ".oases", "plugins");
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= maxResults) return;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxResults) return;
+      if (entry.name.startsWith(".") && ![".oases-plugin", ".claude-plugin"].includes(entry.name)) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) {
+        await visit(absolute);
+      } else if (entry.isFile() && PLUGIN_MANIFEST_PATHS.some((suffix) => relative.endsWith(`/${suffix}`))) {
+        files.push(relative);
+      }
+    }
+  }
+  await visit(pluginsRoot);
+  return files;
+}
+
+async function listPlugins(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const files = (await walkPluginManifestFiles(root, maxResults * 4)).slice(0, maxResults);
+  const plugins = [];
+  for (const file of files) {
+    try {
+      const content = await readFile(workspacePath(root, file), "utf8");
+      const manifest = JSON.parse(content);
+      const pluginRoot = path.dirname(path.dirname(file)).replace(/\\+/g, "/");
+      const summary = await summarizePluginFiles(root, pluginRoot);
+      plugins.push(normalizePluginMetadata(file, manifest, summary));
+    } catch {
+      // Ignore unreadable or invalid plugin manifests.
+    }
+  }
+  plugins.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return { plugins, count: plugins.length, root: ".oases/plugins", truncated: files.length >= maxResults };
+}
+
+async function readPlugin(root, body = {}) {
+  const requested = String(body.path || body.name || body.plugin || "").trim();
+  if (!requested) throw new Error("plugin_read requires path or name.");
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = plugins.plugins.find((plugin) => plugin.name === requested || plugin.id === requested || plugin.path === requested || plugin.root === requested)
+    || plugins.plugins.find((plugin) => plugin.name.toLowerCase() === requestedLower || plugin.id.toLowerCase() === requestedLower || plugin.path.toLowerCase() === requestedLower || plugin.root.toLowerCase() === requestedLower);
+  const pluginPath = matched ? matched.path : requested;
+  const normalized = pluginPath.replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/plugins/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("plugin_read can only read plugin manifests under .oases/plugins.");
+  }
+  if (!PLUGIN_MANIFEST_PATHS.some((suffix) => normalized.endsWith(`/${suffix}`))) {
+    throw new Error("plugin_read can only read plugin.json manifests.");
+  }
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("plugin_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("plugin_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const manifest = JSON.parse(content);
+  const pluginRoot = path.dirname(path.dirname(normalized)).replace(/\\+/g, "/");
+  const summary = await summarizePluginFiles(root, pluginRoot);
+  let readmeContent = "";
+  let readmeTruncated = false;
+  if (summary.readme) {
+    try {
+      const readme = await readFile(workspacePath(root, summary.readme), "utf8");
+      const preview = truncateText(readme, Math.max(1000, Math.min(60000, Number(body.maxChars) || 20000)));
+      readmeContent = preview.text;
+      readmeTruncated = preview.truncated;
+    } catch {
+      // README is optional.
+    }
+  }
+  const plugin = matched ? { ...matched, ...normalizePluginMetadata(normalized, manifest, summary) } : normalizePluginMetadata(normalized, manifest, summary);
+  return {
+    path: normalized,
+    root: pluginRoot,
+    bytes: info.size,
+    content,
+    manifest,
+    plugin,
+    ...(summary.readme ? { readmePath: summary.readme, readme: readmeContent, readmeTruncated } : {}),
+  };
+}
+
+function matchesPluginRequest(plugin, requested, requestedLower = String(requested || "").toLowerCase()) {
+  return plugin.name === requested
+    || plugin.id === requested
+    || plugin.root === requested
+    || plugin.path === requested
+    || plugin.name.toLowerCase() === requestedLower
+    || plugin.id.toLowerCase() === requestedLower
+    || plugin.root.toLowerCase() === requestedLower
+    || plugin.path.toLowerCase() === requestedLower;
+}
+
+async function findPluginByRequest(root, requested) {
+  const value = String(requested || "").trim();
+  if (!value) return undefined;
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const valueLower = value.toLowerCase();
+  return plugins.plugins.find((plugin) => matchesPluginRequest(plugin, value, valueLower));
+}
+
+function normalizePluginAssetPath(value, fallback = ".") {
+  const normalized = String(value || fallback).trim().replace(/\\+/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized === ".") return ".";
+  if (path.isAbsolute(normalized) || normalized === ".." || normalized.includes("../")) {
+    throw new Error("Plugin asset path must stay inside the selected plugin directory.");
+  }
+  return normalized;
+}
+
+async function resolvePluginAssetTarget(root, body = {}, { requireFile = false } = {}) {
+  const pluginName = String(body.plugin || body.name || "").trim();
+  const directPath = String(body.path || "").trim();
+  const requestedAssetPath = String(body.assetPath || body.file || "").trim();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  let plugin;
+  let relativeAssetPath;
+
+  if (pluginName) {
+    const pluginLower = pluginName.toLowerCase();
+    plugin = plugins.plugins.find((item) => matchesPluginRequest(item, pluginName, pluginLower));
+    if (!plugin) throw new Error(`Plugin not found: ${pluginName}`);
+    const requested = normalizePluginAssetPath(requestedAssetPath || directPath || ".");
+    relativeAssetPath = requested === plugin.root ? "." : requested.startsWith(`${plugin.root}/`) ? requested.slice(plugin.root.length + 1) : requested;
+  } else if (directPath) {
+    const normalized = normalizePluginAssetPath(directPath);
+    plugin = plugins.plugins
+      .sort((a, b) => b.root.length - a.root.length)
+      .find((item) => normalized === item.root || normalized.startsWith(`${item.root}/`));
+    if (!plugin) throw new Error("plugin asset path must be inside a known .oases/plugins plugin directory.");
+    relativeAssetPath = normalized === plugin.root ? "." : normalized.slice(plugin.root.length + 1);
+  } else {
+    throw new Error("plugin asset tools require plugin/name or path.");
+  }
+
+  relativeAssetPath = normalizePluginAssetPath(relativeAssetPath || ".");
+  const baseDir = await realpath(workspacePath(root, plugin.root));
+  const target = path.resolve(baseDir, relativeAssetPath === "." ? "" : relativeAssetPath);
+  const resolvedTarget = await realpath(target).catch(() => target);
+  if (!isPathInside(baseDir, resolvedTarget)) throw new Error("Plugin asset path escapes the selected plugin directory.");
+  const info = await stat(resolvedTarget);
+  if (requireFile && !info.isFile()) throw new Error("plugin_asset_read target is not a file.");
+  return {
+    plugin,
+    baseDir,
+    relativeAssetPath,
+    target: resolvedTarget,
+    info,
+    path: relativeAssetPath === "." ? plugin.root : `${plugin.root}/${relativeAssetPath}`,
+  };
+}
+
+async function listPluginAssets(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(500, Number(body.maxResults) || 100));
+  const resolved = await resolvePluginAssetTarget(root, body);
+  if (!resolved.info.isDirectory()) throw new Error("plugin_asset_list target is not a directory.");
+  const assets = [];
+  async function visit(directory) {
+    if (assets.length >= maxResults) return;
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (assets.length >= maxResults) return;
+      if (entry.name === ".DS_Store") continue;
+      const absolute = path.join(directory, entry.name);
+      const realAbsolute = await realpath(absolute).catch(() => absolute);
+      if (!isPathInside(resolved.baseDir, realAbsolute)) continue;
+      const relativePath = path.relative(resolved.baseDir, realAbsolute).replace(/\\+/g, "/");
+      const info = await stat(realAbsolute).catch(() => undefined);
+      if (entry.isDirectory()) {
+        assets.push({ type: "dir", path: relativePath });
+        await visit(realAbsolute);
+      } else if (entry.isFile()) {
+        assets.push({ type: "file", path: relativePath, bytes: info?.size, extension: path.extname(relativePath).toLowerCase() || undefined });
+      }
+    }
+  }
+  await visit(resolved.target);
+  return {
+    plugin: resolved.plugin,
+    root: resolved.plugin.root,
+    baseDir: resolved.baseDir,
+    path: resolved.path,
+    assets,
+    count: assets.length,
+    truncated: assets.length >= maxResults,
+  };
+}
+
+async function readPluginAsset(root, body = {}) {
+  const resolved = await resolvePluginAssetTarget(root, body, { requireFile: true });
+  if (resolved.info.size > 512 * 1024) throw new Error("plugin_asset_read target is too large.");
+  const content = await readFile(resolved.target, "utf8");
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  return {
+    plugin: resolved.plugin,
+    root: resolved.plugin.root,
+    baseDir: resolved.baseDir,
+    path: resolved.path,
+    assetPath: resolved.relativeAssetPath,
+    bytes: resolved.info.size,
+    content: preview.text,
+    truncated: preview.truncated,
+  };
+}
+
+function summarizeHookConfig(content = "") {
+  try {
+    const config = JSON.parse(content);
+    const events = config?.hooks && typeof config.hooks === "object" && !Array.isArray(config.hooks)
+      ? Object.entries(config.hooks).map(([event, entries]) => {
+        const groups = Array.isArray(entries) ? entries : [];
+        const hooks = groups.flatMap((group) => Array.isArray(group?.hooks) ? group.hooks : []);
+        return {
+          event,
+          groups: groups.length,
+          hookCount: hooks.length,
+          matchers: groups.map((group) => group?.matcher).filter(Boolean),
+          commands: hooks.map((hook) => hook?.command).filter(Boolean),
+          types: [...new Set(hooks.map((hook) => hook?.type).filter(Boolean))],
+        };
+      })
+      : [];
+    return {
+      description: typeof config?.description === "string" ? config.description : "",
+      events,
+      eventNames: events.map((event) => event.event),
+      hookCount: events.reduce((sum, event) => sum + event.hookCount, 0),
+      config,
+    };
+  } catch {
+    return { description: "", events: [], eventNames: [], hookCount: 0, config: undefined };
+  }
+}
+
+function normalizePluginHookMetadata(file, content = "", plugin = {}, size = undefined) {
+  const extension = path.extname(file).toLowerCase();
+  const fallbackName = path.basename(file, extension);
+  const configSummary = extension === ".json" ? summarizeHookConfig(content) : undefined;
+  return {
+    id: `${plugin.name || plugin.id || path.basename(path.dirname(path.dirname(file)))}:${fallbackName}`,
+    name: fallbackName,
+    path: file,
+    plugin: plugin.name || plugin.id || "",
+    pluginRoot: plugin.root || path.dirname(path.dirname(file)).replace(/\\+/g, "/"),
+    kind: extension === ".json" ? "config" : "handler",
+    extension: extension || undefined,
+    bytes: size,
+    description: configSummary?.description || "",
+    events: configSummary?.eventNames || [],
+    hookCount: configSummary?.hookCount || 0,
+    commands: configSummary?.events?.flatMap((event) => event.commands).filter(Boolean) || [],
+  };
+}
+
+async function listPluginHooks(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const requestedPlugin = String(body.plugin || body.name || "").trim();
+  const requestedLower = requestedPlugin.toLowerCase();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const includeDisabled = body.includeDisabled === true;
+  const selectedPlugins = requestedPlugin
+    ? plugins.plugins.filter((plugin) => matchesPluginRequest(plugin, requestedPlugin, requestedLower))
+    : plugins.plugins.filter((plugin) => includeDisabled || plugin.enabled !== false);
+  const hooks = [];
+  for (const plugin of selectedPlugins) {
+    for (const hookPath of plugin.hooks || []) {
+      if (hooks.length >= maxResults) break;
+      try {
+        const info = await stat(workspacePath(root, hookPath));
+        if (!info.isFile() || info.size > 512 * 1024) continue;
+        const content = await readFile(workspacePath(root, hookPath), "utf8");
+        hooks.push(normalizePluginHookMetadata(hookPath, content, plugin, info.size));
+      } catch {
+        // Ignore unreadable hook files.
+      }
+    }
+    if (hooks.length >= maxResults) break;
+  }
+  hooks.sort((a, b) => a.plugin.localeCompare(b.plugin) || a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return {
+    hooks,
+    count: hooks.length,
+    plugin: requestedPlugin || undefined,
+    root: ".oases/plugins/*/hooks",
+    truncated: hooks.length >= maxResults,
+  };
+}
+
+function validatePluginHookPath(hookPath) {
+  const normalized = String(hookPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/plugins/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("plugin_hook_read can only read hook files under .oases/plugins.");
+  }
+  const isHookFile = normalized.includes("/hooks/") || normalized.includes("/hooks-handlers/");
+  if (!isHookFile || !/\.(json|js|mjs|cjs|py|sh)$/i.test(normalized)) {
+    throw new Error("plugin_hook_read can only read JSON or script files under plugin hooks directories.");
+  }
+  return normalized;
+}
+
+async function readPluginHook(root, body = {}) {
+  const requested = String(body.path || body.hook || body.name || "").trim();
+  if (!requested) throw new Error("plugin_hook_read requires path, hook, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const hooks = await listPluginHooks(root, { plugin: pluginFilter, includeDisabled: body.includeDisabled === true, maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = hooks.hooks.find((hook) => (
+    hook.path === requested
+    || hook.name === requested
+    || hook.id === requested
+  )) || hooks.hooks.find((hook) => (
+    hook.path.toLowerCase() === requestedLower
+    || hook.name.toLowerCase() === requestedLower
+    || hook.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validatePluginHookPath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("plugin_hook_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("plugin_hook_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const pluginRoot = normalized.includes("/hooks-handlers/")
+    ? path.dirname(path.dirname(normalized)).replace(/\\+/g, "/")
+    : path.dirname(path.dirname(normalized)).replace(/\\+/g, "/");
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const plugin = plugins.plugins.find((item) => item.root === pluginRoot) || { name: path.basename(pluginRoot), id: path.basename(pluginRoot), root: pluginRoot };
+  const hook = normalizePluginHookMetadata(normalized, content, plugin, info.size);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  return {
+    path: normalized,
+    root: pluginRoot,
+    bytes: info.size,
+    content: preview.text,
+    hook,
+    plugin,
+    ...(hook.kind === "config" ? { config: summarizeHookConfig(content).config, events: summarizeHookConfig(content).events } : {}),
+    truncated: preview.truncated,
+  };
+}
+
+function normalizePluginCommandMetadata(file, content = "", plugin = {}) {
+  const parsed = parseMarkdownFrontmatter(content);
+  const fallbackName = path.basename(file, path.extname(file));
+  const heading = parsed.body.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() || "";
+  const metadataName = typeof parsed.metadata.name === "string" && parsed.metadata.name ? parsed.metadata.name : "";
+  const title = typeof parsed.metadata.title === "string" && parsed.metadata.title
+    ? parsed.metadata.title
+    : heading || metadataName || fallbackName;
+  return {
+    id: `${plugin.name || plugin.id || path.basename(path.dirname(path.dirname(file)))}:${fallbackName}`,
+    name: metadataName || fallbackName,
+    title,
+    description: typeof parsed.metadata.description === "string" ? parsed.metadata.description : "",
+    path: file,
+    plugin: plugin.name || plugin.id || "",
+    pluginRoot: plugin.root || path.dirname(path.dirname(file)).replace(/\\+/g, "/"),
+    metadata: parsed.metadata,
+  };
+}
+
+function normalizeWorkspaceCommandMetadata(file, content = "") {
+  const parsed = parseMarkdownFrontmatter(content);
+  const fallbackName = path.basename(file, path.extname(file));
+  const heading = parsed.body.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() || "";
+  const metadataName = typeof parsed.metadata.name === "string" && parsed.metadata.name ? parsed.metadata.name : "";
+  return {
+    id: metadataName || fallbackName,
+    name: metadataName || fallbackName,
+    title: typeof parsed.metadata.title === "string" && parsed.metadata.title ? parsed.metadata.title : heading || metadataName || fallbackName,
+    description: typeof parsed.metadata.description === "string" ? parsed.metadata.description : "",
+    path: file,
+    source: "workspace",
+    metadata: parsed.metadata,
+  };
+}
+
+async function walkCommandFiles(root, maxResults = 100) {
+  const commandsRoot = path.join(root, ".oases", "commands");
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= maxResults) return;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxResults) return;
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) await visit(absolute);
+      else if (entry.isFile() && /\.md$/i.test(entry.name)) files.push(relative);
+    }
+  }
+  await visit(commandsRoot);
+  return files;
+}
+
+async function listCommands(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const files = (await walkCommandFiles(root, maxResults * 4))
+    .filter((file) => file.startsWith(".oases/commands/"))
+    .slice(0, maxResults);
+  const commands = [];
+  for (const file of files) {
+    try {
+      const target = workspacePath(root, file);
+      const info = await stat(target);
+      if (!info.isFile() || info.size > 512 * 1024) continue;
+      const content = await readFile(target, "utf8");
+      commands.push({ ...normalizeWorkspaceCommandMetadata(file, content), bytes: info.size });
+    } catch {
+      // Ignore unreadable command files.
+    }
+  }
+  commands.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return { commands, count: commands.length, root: ".oases/commands", truncated: files.length >= maxResults };
+}
+
+function validateWorkspaceCommandPath(commandPath) {
+  const normalized = String(commandPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/commands/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("command_read can only read command files under .oases/commands.");
+  }
+  if (!/\.md$/i.test(normalized)) throw new Error("command_read can only read Markdown command files.");
+  return normalized;
+}
+
+async function readCommand(root, body = {}) {
+  const requested = String(body.path || body.command || body.name || "").trim();
+  if (!requested) throw new Error("command_read requires path, command, or name.");
+  const commands = await listCommands(root, { maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = commands.commands.find((command) => (
+    command.path === requested
+    || command.name === requested
+    || command.title === requested
+    || command.id === requested
+  )) || commands.commands.find((command) => (
+    command.path.toLowerCase() === requestedLower
+    || command.name.toLowerCase() === requestedLower
+    || command.title.toLowerCase() === requestedLower
+    || command.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validateWorkspaceCommandPath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("command_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("command_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const command = normalizeWorkspaceCommandMetadata(normalized, content);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const bodyPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    path: normalized,
+    bytes: info.size,
+    content: preview.text,
+    body: bodyPreview.text,
+    metadata: parsed.metadata,
+    command,
+    truncated: preview.truncated || bodyPreview.truncated,
+  };
+}
+
+async function listPluginCommands(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const requestedPlugin = String(body.plugin || body.name || "").trim();
+  const requestedLower = requestedPlugin.toLowerCase();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const includeDisabled = body.includeDisabled === true;
+  const selectedPlugins = requestedPlugin
+    ? plugins.plugins.filter((plugin) => (
+      plugin.name === requestedPlugin
+      || plugin.id === requestedPlugin
+      || plugin.root === requestedPlugin
+      || plugin.path === requestedPlugin
+      || plugin.name.toLowerCase() === requestedLower
+      || plugin.id.toLowerCase() === requestedLower
+      || plugin.root.toLowerCase() === requestedLower
+      || plugin.path.toLowerCase() === requestedLower
+    ))
+    : plugins.plugins.filter((plugin) => includeDisabled || plugin.enabled !== false);
+  const commands = [];
+  for (const plugin of selectedPlugins) {
+    for (const commandPath of plugin.commands || []) {
+      if (commands.length >= maxResults) break;
+      try {
+        const info = await stat(workspacePath(root, commandPath));
+        if (!info.isFile() || info.size > 512 * 1024) continue;
+        const content = await readFile(workspacePath(root, commandPath), "utf8");
+        commands.push({ ...normalizePluginCommandMetadata(commandPath, content, plugin), bytes: info.size });
+      } catch {
+        // Ignore unreadable command files.
+      }
+    }
+    if (commands.length >= maxResults) break;
+  }
+  commands.sort((a, b) => a.plugin.localeCompare(b.plugin) || a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return {
+    commands,
+    count: commands.length,
+    plugin: requestedPlugin || undefined,
+    root: ".oases/plugins/*/commands",
+    truncated: commands.length >= maxResults,
+  };
+}
+
+function validatePluginCommandPath(commandPath) {
+  const normalized = String(commandPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/plugins/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("plugin_command_read can only read command files under .oases/plugins.");
+  }
+  if (!normalized.includes("/commands/") || !/\.md$/i.test(normalized)) {
+    throw new Error("plugin_command_read can only read Markdown command files under a plugin commands directory.");
+  }
+  return normalized;
+}
+
+async function readPluginCommand(root, body = {}) {
+  const requested = String(body.path || body.command || body.name || "").trim();
+  if (!requested) throw new Error("plugin_command_read requires path, command, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const commands = await listPluginCommands(root, { plugin: pluginFilter, maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = commands.commands.find((command) => (
+    command.path === requested
+    || command.name === requested
+    || command.title === requested
+    || command.id === requested
+  )) || commands.commands.find((command) => (
+    command.path.toLowerCase() === requestedLower
+    || command.name.toLowerCase() === requestedLower
+    || command.title.toLowerCase() === requestedLower
+    || command.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validatePluginCommandPath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("plugin_command_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("plugin_command_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const pluginRoot = path.dirname(path.dirname(normalized)).replace(/\\+/g, "/");
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const plugin = plugins.plugins.find((item) => item.root === pluginRoot) || { name: path.basename(pluginRoot), id: path.basename(pluginRoot), root: pluginRoot };
+  const command = normalizePluginCommandMetadata(normalized, content, plugin);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const bodyPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    path: normalized,
+    root: pluginRoot,
+    bytes: info.size,
+    content: preview.text,
+    body: bodyPreview.text,
+    metadata: parsed.metadata,
+    command,
+    plugin,
+    truncated: preview.truncated || bodyPreview.truncated,
+  };
+}
+
+async function installPluginCommand(root, body = {}) {
+  const requested = String(body.path || body.command || body.name || "").trim();
+  if (!requested) throw new Error("plugin_command_install requires path, command, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const commands = await listPluginCommands(root, { plugin: pluginFilter, includeDisabled: body.includeDisabled === true, maxResults: 500 });
+  const requestedLower = requested.toLowerCase();
+  const sourceCommand = commands.commands.find((command) => (
+    command.path === requested
+    || command.name === requested
+    || command.title === requested
+    || command.id === requested
+  )) || commands.commands.find((command) => (
+    command.path.toLowerCase() === requestedLower
+    || command.name.toLowerCase() === requestedLower
+    || command.title.toLowerCase() === requestedLower
+    || command.id.toLowerCase() === requestedLower
+  ));
+  if (!sourceCommand) throw new Error(`Plugin command not found: ${requested}`);
+  const sourceFile = workspacePath(root, validatePluginCommandPath(sourceCommand.path));
+  const sourceReal = await realpath(sourceFile);
+  const pluginRoot = await realpath(workspacePath(root, sourceCommand.pluginRoot));
+  if (!isPathInside(pluginRoot, sourceReal)) throw new Error("plugin_command_install source escapes the selected plugin directory.");
+  const defaultName = sourceCommand.name || path.basename(sourceCommand.path, path.extname(sourceCommand.path));
+  const normalizedTargetName = normalizeInstallName(body.targetName || defaultName, "plugin_command_install");
+  const targetFileName = /\.md$/i.test(normalizedTargetName) ? normalizedTargetName : `${normalizedTargetName}.md`;
+  const targetRelativePath = `.oases/commands/${targetFileName}`;
+  await mkdir(workspacePath(root, ".oases/commands"), { recursive: true });
+  const targetFile = workspacePath(root, targetRelativePath);
+  if (await fileExists(targetFile)) throw new Error(`Workspace command already exists: ${targetRelativePath}`);
+  await copyFile(sourceReal, targetFile);
+  const installedInfo = await stat(targetFile);
+  return {
+    installed: true,
+    name: path.basename(targetFileName, path.extname(targetFileName)),
+    sourceCommand,
+    sourcePlugin: sourceCommand.plugin,
+    path: targetRelativePath,
+    bytes: installedInfo.size,
+    artifacts: [{ type: "file", role: "installed_plugin_command", path: targetRelativePath, bytes: installedInfo.size }],
   };
 }
 
@@ -877,6 +2146,312 @@ function normalizeAgentMetadata(file, metadata = {}) {
     ...(disallowedTools ? { disallowedTools } : {}),
     ...(skills ? { skills } : {}),
     ...(initialPrompt ? { initialPrompt } : {}),
+  };
+}
+
+function normalizePluginAgentMetadata(file, content = "", plugin = {}) {
+  const parsed = parseMarkdownFrontmatter(content);
+  const agent = normalizeAgentMetadata(file, parsed.metadata);
+  const fallbackName = path.basename(file, path.extname(file));
+  const pluginName = plugin.name || plugin.id || path.basename(path.dirname(path.dirname(file)));
+  return {
+    ...agent,
+    id: `${pluginName}:${agent.name || fallbackName}`,
+    plugin: pluginName,
+    pluginRoot: plugin.root || path.dirname(path.dirname(file)).replace(/\\+/g, "/"),
+    source: "plugin",
+    metadata: parsed.metadata,
+  };
+}
+
+async function listPluginAgents(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const requestedPlugin = String(body.plugin || body.name || "").trim();
+  const requestedLower = requestedPlugin.toLowerCase();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const includeDisabled = body.includeDisabled === true;
+  const selectedPlugins = requestedPlugin
+    ? plugins.plugins.filter((plugin) => (
+      plugin.name === requestedPlugin
+      || plugin.id === requestedPlugin
+      || plugin.root === requestedPlugin
+      || plugin.path === requestedPlugin
+      || plugin.name.toLowerCase() === requestedLower
+      || plugin.id.toLowerCase() === requestedLower
+      || plugin.root.toLowerCase() === requestedLower
+      || plugin.path.toLowerCase() === requestedLower
+    ))
+    : plugins.plugins.filter((plugin) => includeDisabled || plugin.enabled !== false);
+  const agents = [];
+  for (const plugin of selectedPlugins) {
+    for (const agentPath of plugin.agents || []) {
+      if (agents.length >= maxResults) break;
+      try {
+        const info = await stat(workspacePath(root, agentPath));
+        if (!info.isFile() || info.size > 512 * 1024) continue;
+        const content = await readFile(workspacePath(root, agentPath), "utf8");
+        agents.push({ ...normalizePluginAgentMetadata(agentPath, content, plugin), bytes: info.size });
+      } catch {
+        // Ignore unreadable plugin agent files.
+      }
+    }
+    if (agents.length >= maxResults) break;
+  }
+  agents.sort((a, b) => a.plugin.localeCompare(b.plugin) || a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return {
+    agents,
+    count: agents.length,
+    plugin: requestedPlugin || undefined,
+    root: ".oases/plugins/*/agents",
+    truncated: agents.length >= maxResults,
+  };
+}
+
+function validatePluginAgentPath(agentPath) {
+  const normalized = String(agentPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/plugins/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("plugin_agent_read can only read agent files under .oases/plugins.");
+  }
+  if (!normalized.includes("/agents/") || !/\.md$/i.test(normalized)) {
+    throw new Error("plugin_agent_read can only read Markdown agent files under a plugin agents directory.");
+  }
+  return normalized;
+}
+
+async function readPluginAgent(root, body = {}) {
+  const requested = String(body.path || body.agent || body.name || "").trim();
+  if (!requested) throw new Error("plugin_agent_read requires path, agent, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const agents = await listPluginAgents(root, { plugin: pluginFilter, maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = agents.agents.find((agent) => (
+    agent.path === requested
+    || agent.name === requested
+    || agent.id === requested
+  )) || agents.agents.find((agent) => (
+    agent.path.toLowerCase() === requestedLower
+    || agent.name.toLowerCase() === requestedLower
+    || agent.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validatePluginAgentPath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("plugin_agent_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("plugin_agent_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const pluginRoot = path.dirname(path.dirname(normalized)).replace(/\\+/g, "/");
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const plugin = plugins.plugins.find((item) => item.root === pluginRoot) || { name: path.basename(pluginRoot), id: path.basename(pluginRoot), root: pluginRoot };
+  const agent = normalizePluginAgentMetadata(normalized, content, plugin);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const promptPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    path: normalized,
+    root: pluginRoot,
+    bytes: info.size,
+    content: preview.text,
+    prompt: promptPreview.text,
+    metadata: parsed.metadata,
+    agent,
+    plugin,
+    truncated: preview.truncated || promptPreview.truncated,
+  };
+}
+
+async function installPluginAgent(root, body = {}) {
+  const requested = String(body.path || body.agent || body.name || "").trim();
+  if (!requested) throw new Error("plugin_agent_install requires path, agent, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const agents = await listPluginAgents(root, { plugin: pluginFilter, includeDisabled: body.includeDisabled === true, maxResults: 500 });
+  const requestedLower = requested.toLowerCase();
+  const sourceAgent = agents.agents.find((agent) => (
+    agent.path === requested
+    || agent.name === requested
+    || agent.id === requested
+  )) || agents.agents.find((agent) => (
+    agent.path.toLowerCase() === requestedLower
+    || agent.name.toLowerCase() === requestedLower
+    || agent.id.toLowerCase() === requestedLower
+  ));
+  if (!sourceAgent) throw new Error(`Plugin agent not found: ${requested}`);
+  const sourceFile = workspacePath(root, validatePluginAgentPath(sourceAgent.path));
+  const sourceReal = await realpath(sourceFile);
+  const pluginRoot = await realpath(workspacePath(root, sourceAgent.pluginRoot));
+  if (!isPathInside(pluginRoot, sourceReal)) throw new Error("plugin_agent_install source escapes the selected plugin directory.");
+  const defaultName = sourceAgent.name || path.basename(sourceAgent.path, path.extname(sourceAgent.path));
+  const normalizedTargetName = normalizeInstallName(body.targetName || defaultName, "plugin_agent_install");
+  const targetFileName = /\.md$/i.test(normalizedTargetName) ? normalizedTargetName : `${normalizedTargetName}.md`;
+  const targetRelativePath = `.oases/agents/${targetFileName}`;
+  await mkdir(workspacePath(root, ".oases/agents"), { recursive: true });
+  const targetFile = workspacePath(root, targetRelativePath);
+  if (await fileExists(targetFile)) throw new Error(`Workspace agent already exists: ${targetRelativePath}`);
+  await copyFile(sourceReal, targetFile);
+  const installedInfo = await stat(targetFile);
+  return {
+    installed: true,
+    name: path.basename(targetFileName, path.extname(targetFileName)),
+    sourceAgent,
+    sourcePlugin: sourceAgent.plugin,
+    path: targetRelativePath,
+    bytes: installedInfo.size,
+    artifacts: [{ type: "file", role: "installed_plugin_agent", path: targetRelativePath, bytes: installedInfo.size }],
+  };
+}
+
+function normalizePluginSkillMetadata(file, content = "", plugin = {}) {
+  const metadata = parseSkillFrontmatter(content);
+  const fallbackName = path.basename(path.dirname(file));
+  const name = typeof metadata.name === "string" && metadata.name ? metadata.name : fallbackName;
+  const pluginName = plugin.name || plugin.id || path.basename(path.dirname(path.dirname(path.dirname(file))));
+  return {
+    id: `${pluginName}:${name}`,
+    name,
+    description: typeof metadata.description === "string" ? metadata.description : "",
+    path: file,
+    plugin: pluginName,
+    pluginRoot: plugin.root || path.dirname(path.dirname(path.dirname(file))).replace(/\\+/g, "/"),
+    source: "plugin",
+    root: "plugin skills",
+    baseDir: path.dirname(file),
+    metadata,
+  };
+}
+
+async function listPluginSkills(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const requestedPlugin = String(body.plugin || body.name || "").trim();
+  const requestedLower = requestedPlugin.toLowerCase();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const includeDisabled = body.includeDisabled === true;
+  const selectedPlugins = requestedPlugin
+    ? plugins.plugins.filter((plugin) => (
+      plugin.name === requestedPlugin
+      || plugin.id === requestedPlugin
+      || plugin.root === requestedPlugin
+      || plugin.path === requestedPlugin
+      || plugin.name.toLowerCase() === requestedLower
+      || plugin.id.toLowerCase() === requestedLower
+      || plugin.root.toLowerCase() === requestedLower
+      || plugin.path.toLowerCase() === requestedLower
+    ))
+    : plugins.plugins.filter((plugin) => includeDisabled || plugin.enabled !== false);
+  const skills = [];
+  for (const plugin of selectedPlugins) {
+    for (const skillPath of plugin.skills || []) {
+      if (skills.length >= maxResults) break;
+      try {
+        const target = workspacePath(root, skillPath);
+        const info = await stat(target);
+        if (!info.isFile() || info.size > 512 * 1024) continue;
+        const content = await readFile(target, "utf8");
+        skills.push({ ...normalizePluginSkillMetadata(skillPath, content, plugin), baseDir: path.dirname(target), bytes: info.size });
+      } catch {
+        // Ignore unreadable plugin skill files.
+      }
+    }
+    if (skills.length >= maxResults) break;
+  }
+  skills.sort((a, b) => a.plugin.localeCompare(b.plugin) || a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return {
+    skills,
+    count: skills.length,
+    plugin: requestedPlugin || undefined,
+    root: ".oases/plugins/*/skills",
+    truncated: skills.length >= maxResults,
+  };
+}
+
+function validatePluginSkillPath(skillPath) {
+  const normalized = String(skillPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/plugins/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("plugin_skill_read can only read skill files under .oases/plugins.");
+  }
+  if (!normalized.includes("/skills/") || !/(^|\/)SKILL\.md$/i.test(normalized)) {
+    throw new Error("plugin_skill_read can only read SKILL.md files under a plugin skills directory.");
+  }
+  return normalized;
+}
+
+async function readPluginSkill(root, body = {}) {
+  const requested = String(body.path || body.skill || body.name || "").trim();
+  if (!requested) throw new Error("plugin_skill_read requires path, skill, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const skills = await listPluginSkills(root, { plugin: pluginFilter, maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = skills.skills.find((skill) => (
+    skill.path === requested
+    || skill.name === requested
+    || skill.id === requested
+  )) || skills.skills.find((skill) => (
+    skill.path.toLowerCase() === requestedLower
+    || skill.name.toLowerCase() === requestedLower
+    || skill.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validatePluginSkillPath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("plugin_skill_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("plugin_skill_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const pluginRoot = normalized.split("/skills/")[0];
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const plugin = plugins.plugins.find((item) => item.root === pluginRoot) || { name: path.basename(pluginRoot), id: path.basename(pluginRoot), root: pluginRoot };
+  const skill = { ...normalizePluginSkillMetadata(normalized, content, plugin), baseDir: path.dirname(target) };
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  return {
+    path: normalized,
+    root: pluginRoot,
+    source: "plugin",
+    baseDir: path.dirname(target),
+    bytes: info.size,
+    content: preview.text,
+    metadata: parseSkillFrontmatter(content),
+    skill,
+    plugin,
+    truncated: preview.truncated,
+  };
+}
+
+async function installPluginSkill(root, body = {}) {
+  const requested = String(body.path || body.skill || body.name || "").trim();
+  if (!requested) throw new Error("plugin_skill_install requires path, skill, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const skills = await listPluginSkills(root, { plugin: pluginFilter, includeDisabled: body.includeDisabled === true, maxResults: 500 });
+  const requestedLower = requested.toLowerCase();
+  const sourceSkill = skills.skills.find((skill) => (
+    skill.path === requested
+    || skill.name === requested
+    || skill.id === requested
+  )) || skills.skills.find((skill) => (
+    skill.path.toLowerCase() === requestedLower
+    || skill.name.toLowerCase() === requestedLower
+    || skill.id.toLowerCase() === requestedLower
+  ));
+  if (!sourceSkill) throw new Error(`Plugin skill not found: ${requested}`);
+  const sourceFile = workspacePath(root, validatePluginSkillPath(sourceSkill.path));
+  const sourceDir = await realpath(path.dirname(sourceFile));
+  const pluginRoot = await realpath(workspacePath(root, sourceSkill.pluginRoot));
+  if (!isPathInside(pluginRoot, sourceDir)) throw new Error("plugin_skill_install source escapes the selected plugin directory.");
+  const targetName = normalizeInstallName(body.targetName || sourceSkill.name || path.basename(sourceDir), "plugin_skill_install");
+  const targetRelativeDir = `.oases/skills/${targetName}`;
+  await mkdir(workspacePath(root, ".oases/skills"), { recursive: true });
+  const targetDir = workspacePath(root, targetRelativeDir);
+  if (await directoryExists(targetDir)) throw new Error(`Workspace skill already exists: ${targetRelativeDir}`);
+  await copySkillDirectory(sourceDir, targetDir, sourceDir);
+  const installedSkillPath = `${targetRelativeDir}/SKILL.md`;
+  const installedInfo = await stat(workspacePath(root, installedSkillPath));
+  return {
+    installed: true,
+    name: targetName,
+    sourceSkill,
+    sourcePlugin: sourceSkill.plugin,
+    path: installedSkillPath,
+    targetDir: targetRelativeDir,
+    bytes: installedInfo.size,
+    artifacts: [{ type: "file", role: "installed_plugin_skill", path: installedSkillPath, bytes: installedInfo.size }],
   };
 }
 
@@ -1207,6 +2782,214 @@ export const TOOL_REGISTRY = {
     inputSchema: { type: "object", properties: { name: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
     execute: (root, body) => readSkill(root, body),
   },
+  skill_asset_list: {
+    name: "skill_asset_list",
+    title: "List Oases skill assets",
+    description: "List files inside a workspace-local or bundled Oases skill directory, such as references, scripts, and evals. Accepts a skill name plus optional assetPath, or a direct path under .oases/skills or OcliSkills.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, skill: { type: "string" }, path: { type: "string" }, assetPath: { type: "string" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listSkillAssets(root, body),
+  },
+  skill_asset_read: {
+    name: "skill_asset_read",
+    title: "Read Oases skill asset",
+    description: "Read a UTF-8 text asset inside a workspace-local or bundled Oases skill directory. Use this for skill references, scripts, and examples after skill_read loads the main SKILL.md.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, skill: { type: "string" }, path: { type: "string" }, assetPath: { type: "string" }, file: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readSkillAsset(root, body),
+  },
+  skill_install: {
+    name: "skill_install",
+    title: "Install bundled Oases skill",
+    description: "Copy a bundled Oases skill into the current workspace under .oases/skills/<targetName> so the project can customize it. Refuses to overwrite an existing workspace skill.",
+    risk: "write",
+    inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string", description: "Bundled skill name to install, such as web-search." }, skill: { type: "string" }, targetName: { type: "string", description: "Optional workspace skill directory name. Defaults to the bundled skill directory name." } } },
+    execute: (root, body) => installSkill(root, body),
+  },
+  command_list: {
+    name: "command_list",
+    title: "List workspace commands",
+    description: "List workspace-local Markdown command templates under .oases/commands. These are reusable prompt templates and are not executed by this tool.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { maxResults: { type: "number" } } },
+    execute: (root, body) => listCommands(root, body),
+  },
+  command_read: {
+    name: "command_read",
+    title: "Read workspace command",
+    description: "Read a workspace-local Markdown command template under .oases/commands by name or relative path. This does not execute command content.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, command: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readCommand(root, body),
+  },
+  plugin_list: {
+    name: "plugin_list",
+    title: "List workspace plugins",
+    description: "List workspace-local Oases/Claude-style plugin manifests under .oases/plugins. This discovers plugin.json plus command, agent, hook, and README file summaries.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { maxResults: { type: "number" } } },
+    execute: (root, body) => listPlugins(root, body),
+  },
+  plugin_read: {
+    name: "plugin_read",
+    title: "Read workspace plugin",
+    description: "Read a workspace-local plugin manifest under .oases/plugins by plugin name, root, or manifest path. Supports .oases-plugin/plugin.json and .claude-plugin/plugin.json.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, plugin: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPlugin(root, body),
+  },
+  plugin_capability_list: {
+    name: "plugin_capability_list",
+    title: "List plugin manifest capabilities",
+    description: "List read-only capability summaries from workspace-local plugin manifests, including MCP/LSP declarations, settings keys, custom paths, command metadata, output styles, and settings.json presence. This does not start servers, apply settings, or execute plugin files.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, path: { type: "string" }, includeDisabled: { type: "boolean" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginCapabilities(root, body),
+  },
+  plugin_capability_read: {
+    name: "plugin_capability_read",
+    title: "Read plugin manifest capabilities",
+    description: "Read a single workspace-local plugin's manifest capability details in a safe summarized form. Settings values are shape-only and sensitive keys are redacted; MCP/LSP servers are not started.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, path: { type: "string" }, includeDisabled: { type: "boolean" } } },
+    execute: (root, body) => readPluginCapability(root, body),
+  },
+  plugin_command_list: {
+    name: "plugin_command_list",
+    title: "List plugin commands",
+    description: "List Markdown command templates from workspace-local plugins under .oases/plugins/<plugin>/commands. This is read-only discovery; commands are not executed.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, includeDisabled: { type: "boolean" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginCommands(root, body),
+  },
+  plugin_command_read: {
+    name: "plugin_command_read",
+    title: "Read plugin command",
+    description: "Read a Markdown command template from a workspace-local plugin commands directory by plugin/name or relative path. This does not execute plugin code.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, command: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPluginCommand(root, body),
+  },
+  plugin_command_install: {
+    name: "plugin_command_install",
+    title: "Install plugin command",
+    description: "Copy a Markdown command template from an installed workspace plugin into .oases/commands/<targetName>.md so it can be used as a normal workspace command template.",
+    risk: "write",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, command: { type: "string" }, path: { type: "string" }, targetName: { type: "string" }, includeDisabled: { type: "boolean" } } },
+    execute: (root, body) => installPluginCommand(root, body),
+  },
+  plugin_hook_list: {
+    name: "plugin_hook_list",
+    title: "List plugin hooks",
+    description: "List hook configuration and handler files from workspace-local plugins under .oases/plugins/<plugin>/hooks or hooks-handlers. This is read-only discovery; hooks are not executed.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, includeDisabled: { type: "boolean" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginHooks(root, body),
+  },
+  plugin_hook_read: {
+    name: "plugin_hook_read",
+    title: "Read plugin hook",
+    description: "Read a hook JSON configuration or hook handler script from a workspace-local plugin by plugin/name or relative path. This does not execute hook code.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, hook: { type: "string" }, path: { type: "string" }, includeDisabled: { type: "boolean" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPluginHook(root, body),
+  },
+  plugin_agent_list: {
+    name: "plugin_agent_list",
+    title: "List plugin agents",
+    description: "List Markdown agent definitions from workspace-local plugins under .oases/plugins/<plugin>/agents. This is read-only discovery; plugin agents are not executed by this tool.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, includeDisabled: { type: "boolean" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginAgents(root, body),
+  },
+  plugin_agent_read: {
+    name: "plugin_agent_read",
+    title: "Read plugin agent",
+    description: "Read a Markdown agent definition from a workspace-local plugin agents directory by plugin/name or relative path. This does not execute the plugin agent.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, agent: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPluginAgent(root, body),
+  },
+  plugin_agent_install: {
+    name: "plugin_agent_install",
+    title: "Install plugin agent",
+    description: "Copy a Markdown agent definition from an installed workspace plugin into .oases/agents/<targetName>.md so it can be used as a normal workspace custom agent.",
+    risk: "write",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, agent: { type: "string" }, path: { type: "string" }, targetName: { type: "string" }, includeDisabled: { type: "boolean" } } },
+    execute: (root, body) => installPluginAgent(root, body),
+  },
+  plugin_skill_list: {
+    name: "plugin_skill_list",
+    title: "List plugin skills",
+    description: "List SKILL.md definitions from workspace-local plugins under .oases/plugins/<plugin>/skills. This is read-only discovery; plugin skills are not installed or executed by this tool.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, includeDisabled: { type: "boolean" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginSkills(root, body),
+  },
+  plugin_skill_read: {
+    name: "plugin_skill_read",
+    title: "Read plugin skill",
+    description: "Read a SKILL.md definition from a workspace-local plugin skills directory by plugin/name or relative path. This does not install or execute the plugin skill.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, skill: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPluginSkill(root, body),
+  },
+  plugin_skill_install: {
+    name: "plugin_skill_install",
+    title: "Install plugin skill",
+    description: "Copy a skill directory from an installed workspace plugin into .oases/skills/<targetName> so the project can load and customize it as a normal workspace skill.",
+    risk: "write",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, skill: { type: "string" }, path: { type: "string" }, targetName: { type: "string" }, includeDisabled: { type: "boolean" } } },
+    execute: (root, body) => installPluginSkill(root, body),
+  },
+  plugin_asset_list: {
+    name: "plugin_asset_list",
+    title: "List plugin assets",
+    description: "List files inside a workspace-local plugin directory, such as references, scripts, examples, hooks, skills, commands, and agents. This is read-only and does not execute plugin files.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, path: { type: "string" }, assetPath: { type: "string" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginAssets(root, body),
+  },
+  plugin_asset_read: {
+    name: "plugin_asset_read",
+    title: "Read plugin asset",
+    description: "Read a UTF-8 text file inside a workspace-local plugin directory. This is read-only and does not execute scripts or hooks.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, path: { type: "string" }, assetPath: { type: "string" }, file: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPluginAsset(root, body),
+  },
+  plugin_install: {
+    name: "plugin_install",
+    title: "Install workspace plugin",
+    description: "Copy a local plugin directory from the current workspace into .oases/plugins/<targetName>. Requires a supported plugin manifest and refuses to overwrite an existing plugin.",
+    risk: "write",
+    inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string", description: "Workspace-relative source plugin directory path." }, sourcePath: { type: "string" }, source: { type: "string" }, targetName: { type: "string", description: "Optional plugin directory name under .oases/plugins." } } },
+    execute: (root, body) => installPlugin(root, body),
+  },
+  plugin_remove: {
+    name: "plugin_remove",
+    title: "Remove workspace plugin",
+    description: "Remove an installed workspace-local plugin directory under .oases/plugins. The target must contain a supported plugin manifest and requires destructive approval in agent sessions.",
+    risk: "destructive",
+    inputSchema: { type: "object", properties: { name: { type: "string", description: "Plugin manifest name to remove." }, plugin: { type: "string", description: "Plugin name, id, root, or manifest path." }, path: { type: "string", description: "Installed plugin root or manifest path under .oases/plugins." } } },
+    execute: (root, body) => removePlugin(root, body),
+  },
+  plugin_enable: {
+    name: "plugin_enable",
+    title: "Enable workspace plugin",
+    description: "Re-enable an installed workspace-local plugin by removing its .oases-disabled marker.",
+    risk: "write",
+    inputSchema: { type: "object", properties: { name: { type: "string", description: "Plugin manifest name to enable." }, plugin: { type: "string", description: "Plugin name, id, root, or manifest path." }, path: { type: "string", description: "Installed plugin root or manifest path under .oases/plugins." } } },
+    execute: (root, body) => setPluginEnabled(root, body, true),
+  },
+  plugin_disable: {
+    name: "plugin_disable",
+    title: "Disable workspace plugin",
+    description: "Disable an installed workspace-local plugin by writing a .oases-disabled marker without deleting plugin files.",
+    risk: "write",
+    inputSchema: { type: "object", properties: { name: { type: "string", description: "Plugin manifest name to disable." }, plugin: { type: "string", description: "Plugin name, id, root, or manifest path." }, path: { type: "string", description: "Installed plugin root or manifest path under .oases/plugins." } } },
+    execute: (root, body) => setPluginEnabled(root, body, false),
+  },
   agent_list: {
     name: "agent_list",
     title: "List workspace agents",
@@ -1356,6 +3139,9 @@ export function getPermissionPolicy(name, args = {}) {
   }
   if (name === "worktree_remove") {
     return { requiresApproval: true, category: "destructive_worktree_operation", reason: "即将移除隔离 worktree；如果 force 为 true，会丢弃其中未应用的变更。" };
+  }
+  if (name === "plugin_remove") {
+    return { requiresApproval: true, category: "destructive_plugin_operation", reason: "即将删除本地 workspace 中已安装的 ocli 插件目录。" };
   }
   const risk = TOOL_REGISTRY[name]?.risk;
   return { requiresApproval: risk === "destructive", category: risk || "unknown", reason: "该工具需要用户确认。" };

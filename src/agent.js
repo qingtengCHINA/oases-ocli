@@ -658,8 +658,9 @@ export async function runAgent(root, body, options = {}) {
   for (const skill of preloadedSkills) {
     if (loadedSkillPaths.has(skill.path)) continue;
     loadedSkillPaths.add(skill.path);
-    invokedSkills.push({ name: skill.name, description: skill.description || "", path: skill.path });
-    options.onEvent?.({ type: "skill_loaded", turn: -1, skill: { name: skill.name, description: skill.description || "", path: skill.path }, preloaded: true, summary: `ocli 已预加载技能 ${skill.name}` });
+    const skillMetadata = { name: skill.name, description: skill.description || "", path: skill.path, source: skill.source || "workspace", root: skill.root || "" };
+    invokedSkills.push(skillMetadata);
+    options.onEvent?.({ type: "skill_loaded", turn: -1, skill: skillMetadata, preloaded: true, summary: `ocli 已预加载技能 ${skill.name}` });
   }
 
   for (let turn = 0; turn < maxTurns; turn += 1) {
@@ -793,6 +794,58 @@ export async function runAgent(root, body, options = {}) {
                         ? "ocli 已列出工作区技能"
                     : call.name === "skill_read"
                         ? `ocli 已读取技能 ${path || call.arguments?.name || "文件"}`
+                    : call.name === "skill_asset_list"
+                        ? `ocli 已列出技能资源 ${path || call.arguments?.name || call.arguments?.skill || ""}`.trim()
+                    : call.name === "skill_asset_read"
+                        ? `ocli 已读取技能资源 ${path || call.arguments?.assetPath || call.arguments?.file || "文件"}`
+                    : call.name === "skill_install"
+                        ? `ocli 已安装技能 ${data?.name || call.arguments?.targetName || call.arguments?.name || ""}`.trim()
+                    : call.name === "command_list"
+                        ? "ocli 已列出工作区命令"
+                    : call.name === "command_read"
+                        ? `ocli 已读取工作区命令 ${path || call.arguments?.command || call.arguments?.name || "文件"}`
+                    : call.name === "plugin_list"
+                        ? "ocli 已列出工作区插件"
+                    : call.name === "plugin_read"
+                        ? `ocli 已读取插件 ${path || call.arguments?.name || call.arguments?.plugin || "manifest"}`
+                    : call.name === "plugin_capability_list"
+                        ? `ocli 已列出插件能力 ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_capability_read"
+                        ? `ocli 已读取插件能力 ${path || call.arguments?.plugin || call.arguments?.name || "manifest"}`
+                    : call.name === "plugin_command_list"
+                        ? `ocli 已列出插件命令 ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_command_read"
+                        ? `ocli 已读取插件命令 ${path || call.arguments?.command || call.arguments?.name || "文件"}`
+                    : call.name === "plugin_command_install"
+                        ? `ocli 已安装插件命令 ${data?.name || call.arguments?.targetName || call.arguments?.command || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_hook_list"
+                        ? `ocli 已列出插件 Hook ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_hook_read"
+                        ? `ocli 已读取插件 Hook ${path || call.arguments?.hook || call.arguments?.name || "文件"}`
+                    : call.name === "plugin_agent_list"
+                        ? `ocli 已列出插件代理 ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_agent_read"
+                        ? `ocli 已读取插件代理 ${path || call.arguments?.agent || call.arguments?.name || "文件"}`
+                    : call.name === "plugin_agent_install"
+                        ? `ocli 已安装插件代理 ${data?.name || call.arguments?.targetName || call.arguments?.agent || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_skill_list"
+                        ? `ocli 已列出插件技能 ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_skill_read"
+                        ? `ocli 已读取插件技能 ${path || call.arguments?.skill || call.arguments?.name || "文件"}`
+                    : call.name === "plugin_skill_install"
+                        ? `ocli 已安装插件技能 ${data?.name || call.arguments?.targetName || call.arguments?.skill || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_asset_list"
+                        ? `ocli 已列出插件资源 ${call.arguments?.plugin || call.arguments?.name || call.arguments?.path || ""}`.trim()
+                    : call.name === "plugin_asset_read"
+                        ? `ocli 已读取插件资源 ${path || call.arguments?.assetPath || call.arguments?.file || "文件"}`
+                    : call.name === "plugin_install"
+                        ? `ocli 已安装插件 ${data?.name || call.arguments?.targetName || call.arguments?.path || ""}`.trim()
+                    : call.name === "plugin_remove"
+                        ? `ocli 已移除插件 ${data?.name || call.arguments?.name || call.arguments?.plugin || call.arguments?.path || ""}`.trim()
+                    : call.name === "plugin_enable"
+                        ? `ocli 已启用插件 ${data?.name || call.arguments?.name || call.arguments?.plugin || call.arguments?.path || ""}`.trim()
+                    : call.name === "plugin_disable"
+                        ? `ocli 已停用插件 ${data?.name || call.arguments?.name || call.arguments?.plugin || call.arguments?.path || ""}`.trim()
                       : call.name === "agent_run"
                         ? `ocli 子代理已完成 ${call.arguments?.description || call.arguments?.agentType || "任务"}`
                       : `ocli 已运行 ${call.arguments?.command || "命令"}`;
@@ -813,9 +866,10 @@ export async function runAgent(root, body, options = {}) {
       const skill = extractLoadedSkill(result);
       if (!skill || loadedSkillPaths.has(skill.path)) continue;
       loadedSkillPaths.add(skill.path);
-      invokedSkills.push({ name: skill.name, description: skill.description, path: skill.path });
+      const skillMetadata = { name: skill.name, description: skill.description, path: skill.path, source: skill.source || "workspace", root: skill.root || "" };
+      invokedSkills.push(skillMetadata);
       newlyLoadedSkills.push(skill);
-      options.onEvent?.({ type: "skill_loaded", turn, skill: { name: skill.name, description: skill.description, path: skill.path }, summary: `ocli 已加载技能 ${skill.name}` });
+      options.onEvent?.({ type: "skill_loaded", turn, skill: skillMetadata, summary: `ocli 已加载技能 ${skill.name}` });
     }
     const skillContextMessage = buildSkillContextMessage(newlyLoadedSkills);
     if (skillContextMessage) workingMessages.push({ role: "user", content: skillContextMessage });
