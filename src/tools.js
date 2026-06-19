@@ -2,7 +2,8 @@ import { copyFile, mkdir, readdir, readFile, realpath, rm, stat, writeFile } fro
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROJECT_TOOL_NAMES } from "./constants.js";
-import { fetchUrl } from "./network.js";
+import { fetchUrl, webSearch } from "./network.js";
+import { listMcpTools, callMcpTool, listMcpResources, readMcpResource, shutdownAllMcpServers } from "./mcpClient.js";
 import { commandContainsShellControlOperators, getDangerousCommandReason, runProcess } from "./process.js";
 import { listFiles, workspacePath, workspaceRelativePath } from "./workspace.js";
 
@@ -26,6 +27,13 @@ const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(MODULE_DIR, "..");
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, "..");
 const SENSITIVE_KEY_RE = /(?:token|secret|key|password|credential|authorization|auth|api[_-]?key)/i;
+const WORKSPACE_SETTINGS_PATHS = [
+  ".oases/settings.json",
+  ".oases/settings.local.json",
+  ".claude/settings.json",
+  ".claude/settings.local.json",
+];
+const MEMORY_SCOPES = new Set(["project", "team", "private"]);
 
 function truncateText(text, limit) {
   const value = String(text || "");
@@ -622,6 +630,201 @@ function parseMarkdownFrontmatter(content) {
     }
   }
   return { metadata, body: match ? raw.slice(match[0].length) : raw };
+}
+
+function normalizeMemoryScope(value) {
+  const scope = String(value || "project").trim().toLowerCase();
+  if (!MEMORY_SCOPES.has(scope)) throw new Error("memory scope must be project, team, or private.");
+  return scope;
+}
+
+function normalizeMemoryName(value, toolName = "memory_write") {
+  const normalized = String(value || "").trim().replace(/\\+/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized.includes("/") || normalized === "." || normalized === ".." || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error(`${toolName} name must be a single safe memory name.`);
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(normalized)) throw new Error(`${toolName} name may only contain letters, numbers, dot, underscore, or dash.`);
+  const withoutExtension = normalized.replace(/\.md$/i, "");
+  if (!withoutExtension) throw new Error(`${toolName} name must include a non-empty stem.`);
+  return withoutExtension;
+}
+
+function validateMemoryPath(memoryPath, options = {}) {
+  const normalized = String(memoryPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/memory/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("memory tools can only access Markdown files under .oases/memory.");
+  }
+  if (!/\.md$/i.test(normalized)) throw new Error("memory tools can only access Markdown memory files.");
+  const parts = normalized.split("/");
+  if (parts.length !== 4 || !MEMORY_SCOPES.has(parts[2])) {
+    throw new Error("memory path must be under .oases/memory/project, .oases/memory/team, or .oases/memory/private.");
+  }
+  normalizeMemoryName(parts[3], "memory_read");
+  if (options.scope && parts[2] !== normalizeMemoryScope(options.scope)) throw new Error("memory path does not match requested scope.");
+  return normalized;
+}
+
+function memoryPathFromName(name, scope = "project") {
+  return `.oases/memory/${normalizeMemoryScope(scope)}/${normalizeMemoryName(name, "memory_write")}.md`;
+}
+
+function normalizeMemoryMetadata(file, content = "") {
+  const parsed = parseMarkdownFrontmatter(content);
+  const fallbackName = path.basename(file, path.extname(file));
+  const heading = parsed.body.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() || "";
+  const scope = file.split("/")[2] || "project";
+  const metadataName = typeof parsed.metadata.name === "string" && parsed.metadata.name ? parsed.metadata.name : "";
+  const tags = Array.isArray(parsed.metadata.tags)
+    ? parsed.metadata.tags.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim()).slice(0, 20)
+    : typeof parsed.metadata.tags === "string" && parsed.metadata.tags
+      ? parsed.metadata.tags.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 20)
+      : [];
+  return {
+    id: `${scope}:${metadataName || fallbackName}`,
+    name: metadataName || fallbackName,
+    title: typeof parsed.metadata.title === "string" && parsed.metadata.title ? parsed.metadata.title : heading || metadataName || fallbackName,
+    description: typeof parsed.metadata.description === "string" ? parsed.metadata.description : "",
+    scope,
+    tags,
+    path: file,
+    metadata: parsed.metadata,
+  };
+}
+
+async function walkMemoryFiles(root, body = {}) {
+  const scopeFilter = body.scope ? normalizeMemoryScope(body.scope) : "";
+  const maxResults = Math.max(1, Math.min(300, Number(body.maxResults) || 100));
+  const memoryRoot = path.join(root, ".oases", "memory");
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= maxResults) return;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxResults) return;
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) await visit(absolute);
+      else if (entry.isFile() && /\.md$/i.test(entry.name)) {
+        try {
+          files.push(validateMemoryPath(relative, scopeFilter ? { scope: scopeFilter } : {}));
+        } catch {
+          // Ignore malformed memory paths.
+        }
+      }
+    }
+  }
+  if (scopeFilter) await visit(path.join(memoryRoot, scopeFilter));
+  else await visit(memoryRoot);
+  return files.slice(0, maxResults);
+}
+
+async function listMemories(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(300, Number(body.maxResults) || 100));
+  const files = await walkMemoryFiles(root, { ...body, maxResults: maxResults * 3 });
+  const memories = [];
+  for (const file of files.slice(0, maxResults)) {
+    try {
+      const target = workspacePath(root, file);
+      const info = await stat(target);
+      if (!info.isFile() || info.size > 512 * 1024) continue;
+      const content = await readFile(target, "utf8");
+      memories.push({ ...normalizeMemoryMetadata(file, content), bytes: info.size, mtimeMs: info.mtimeMs });
+    } catch {
+      // Ignore unreadable memory files.
+    }
+  }
+  memories.sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0) || a.scope.localeCompare(b.scope) || a.name.localeCompare(b.name));
+  return { memories, count: memories.length, root: ".oases/memory", scopes: [...MEMORY_SCOPES], truncated: files.length > maxResults };
+}
+
+async function readMemory(root, body = {}) {
+  const requested = String(body.path || body.memory || body.name || "").trim();
+  if (!requested) throw new Error("memory_read requires path, memory, or name.");
+  const memories = await listMemories(root, { scope: body.scope, maxResults: 300 });
+  const requestedLower = requested.toLowerCase();
+  const matched = memories.memories.find((memory) => (
+    memory.path === requested
+    || memory.name === requested
+    || memory.title === requested
+    || memory.id === requested
+  )) || memories.memories.find((memory) => (
+    memory.path.toLowerCase() === requestedLower
+    || memory.name.toLowerCase() === requestedLower
+    || memory.title.toLowerCase() === requestedLower
+    || memory.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validateMemoryPath(matched ? matched.path : requested, body.scope ? { scope: body.scope } : {});
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("memory_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("memory_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const bodyPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    memory: normalizeMemoryMetadata(normalized, content),
+    path: normalized,
+    bytes: info.size,
+    content: preview.text,
+    body: bodyPreview.text,
+    metadata: parsed.metadata,
+    truncated: preview.truncated || bodyPreview.truncated,
+  };
+}
+
+function formatMemoryMarkdown(body = {}) {
+  const title = String(body.title || body.name || "Memory").trim();
+  const description = String(body.description || "").trim();
+  const scope = normalizeMemoryScope(body.scope);
+  const tags = Array.isArray(body.tags)
+    ? body.tags.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 20)
+    : typeof body.tags === "string" && body.tags.trim()
+      ? body.tags.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 20)
+      : [];
+  const content = String(body.content || body.body || "").trim();
+  if (!title) throw new Error("memory_write requires title or name.");
+  if (!content) throw new Error("memory_write requires content or body.");
+  const frontmatter = [
+    "---",
+    `name: ${normalizeMemoryName(body.name || title.toLowerCase().replace(/\s+/g, "-"), "memory_write")}`,
+    `title: ${title.replace(/\r?\n/g, " ")}`,
+    ...(description ? [`description: ${description.replace(/\r?\n/g, " ")}`] : []),
+    `scope: ${scope}`,
+    ...(tags.length ? [`tags: [${tags.map((tag) => JSON.stringify(tag)).join(", ")}]`] : []),
+    `updatedAt: ${new Date().toISOString()}`,
+    "---",
+    "",
+  ].join("\n");
+  const bodyContent = content.startsWith("#") ? content : `# ${title}\n\n${content}`;
+  return `${frontmatter}${bodyContent.trimEnd()}\n`;
+}
+
+async function writeMemory(root, body = {}) {
+  const scope = normalizeMemoryScope(body.scope);
+  const normalized = body.path
+    ? validateMemoryPath(body.path, { scope })
+    : memoryPathFromName(body.name || body.title, scope);
+  const target = workspacePath(root, normalized);
+  if (await fileExists(target) && body.overwrite !== true) throw new Error(`Memory already exists: ${normalized}. Pass overwrite: true to replace it.`);
+  await mkdir(path.dirname(target), { recursive: true });
+  const content = formatMemoryMarkdown({ ...body, scope });
+  await writeFile(target, content, "utf8");
+  const info = await stat(target);
+  return {
+    written: true,
+    path: normalized,
+    bytes: info.size,
+    memory: normalizeMemoryMetadata(normalized, content),
+    artifacts: [fileArtifact(normalized, info, "memory_file")],
+  };
 }
 
 function parseSkillFrontmatter(content) {
@@ -1462,6 +1665,82 @@ async function readPluginCapability(root, body = {}) {
   };
 }
 
+function normalizeSettingsPathRequest(value = "") {
+  const requested = String(value || "").trim().replace(/\\+/g, "/").replace(/^\.\/+/, "");
+  if (!requested || requested === "settings" || requested === "project") return ".oases/settings.json";
+  if (requested === "local" || requested === "settings.local") return ".oases/settings.local.json";
+  if (requested === "claude" || requested === "claude-settings") return ".claude/settings.json";
+  if (requested === "claude-local" || requested === "claude-settings.local") return ".claude/settings.local.json";
+  return requested;
+}
+
+function assertWorkspaceSettingsPath(normalized) {
+  if (!WORKSPACE_SETTINGS_PATHS.includes(normalized)) {
+    throw new Error("settings_read can only read .oases/settings.json, .oases/settings.local.json, .claude/settings.json, or .claude/settings.local.json.");
+  }
+}
+
+async function summarizeWorkspaceSettingsFile(root, settingsPath) {
+  const target = workspacePath(root, settingsPath);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error(`Settings target is not a file: ${settingsPath}`);
+  if (info.size > 512 * 1024) {
+    return {
+      path: settingsPath,
+      bytes: info.size,
+      source: settingsPath.startsWith(".claude/") ? "claude" : "oases",
+      tooLarge: true,
+    };
+  }
+  const content = await readFile(target, "utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    return {
+      path: settingsPath,
+      bytes: info.size,
+      source: settingsPath.startsWith(".claude/") ? "claude" : "oases",
+      parseError: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return {
+    path: settingsPath,
+    bytes: info.size,
+    source: settingsPath.startsWith(".claude/") ? "claude" : "oases",
+    settings: summarizeSettingsShape(parsed),
+  };
+}
+
+async function listWorkspaceSettings(root, body = {}) {
+  const includeClaude = body.includeClaude === true;
+  const paths = WORKSPACE_SETTINGS_PATHS.filter((settingsPath) => includeClaude || settingsPath.startsWith(".oases/"));
+  const settingsFiles = [];
+  for (const settingsPath of paths) {
+    try {
+      settingsFiles.push(await summarizeWorkspaceSettingsFile(root, settingsPath));
+    } catch {
+      // Missing settings files are normal for most workspaces.
+    }
+  }
+  settingsFiles.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    settingsFiles,
+    count: settingsFiles.length,
+    roots: includeClaude ? [".oases", ".claude"] : [".oases"],
+    includeClaude,
+  };
+}
+
+async function readWorkspaceSettings(root, body = {}) {
+  const normalized = normalizeSettingsPathRequest(body.path || body.name || body.settings || "");
+  assertWorkspaceSettingsPath(normalized);
+  if (normalized.startsWith(".claude/") && body.includeClaude !== true) {
+    throw new Error("settings_read skips .claude settings unless includeClaude is true.");
+  }
+  return summarizeWorkspaceSettingsFile(root, normalized);
+}
+
 async function walkPluginManifestFiles(root, maxResults = 100) {
   const pluginsRoot = path.join(root, ".oases", "plugins");
   const files = [];
@@ -2083,6 +2362,252 @@ async function installPluginCommand(root, body = {}) {
   };
 }
 
+function normalizeOutputStyleMetadata(file, content = "", plugin = undefined) {
+  const parsed = parseMarkdownFrontmatter(content);
+  const fallbackName = path.basename(file, path.extname(file));
+  const heading = parsed.body.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim() || "";
+  const metadataName = typeof parsed.metadata.name === "string" && parsed.metadata.name ? parsed.metadata.name : "";
+  const title = typeof parsed.metadata.title === "string" && parsed.metadata.title
+    ? parsed.metadata.title
+    : heading || metadataName || fallbackName;
+  const pluginName = plugin ? plugin.name || plugin.id || path.basename(path.dirname(path.dirname(file))) : "";
+  return {
+    id: pluginName ? `${pluginName}:${metadataName || fallbackName}` : metadataName || fallbackName,
+    name: metadataName || fallbackName,
+    title,
+    description: typeof parsed.metadata.description === "string" ? parsed.metadata.description : "",
+    path: file,
+    source: plugin ? "plugin" : "workspace",
+    ...(plugin ? { plugin: pluginName, pluginRoot: plugin.root || path.dirname(path.dirname(file)).replace(/\\+/g, "/") } : {}),
+    metadata: parsed.metadata,
+  };
+}
+
+async function walkOutputStyleFiles(root, maxResults = 100) {
+  const stylesRoot = path.join(root, ".oases", "output-styles");
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= maxResults) return;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxResults) return;
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) await visit(absolute);
+      else if (entry.isFile() && /\.(md|json)$/i.test(entry.name)) files.push(relative);
+    }
+  }
+  await visit(stylesRoot);
+  return files;
+}
+
+async function listOutputStyles(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const files = (await walkOutputStyleFiles(root, maxResults * 4))
+    .filter((file) => file.startsWith(".oases/output-styles/"))
+    .slice(0, maxResults);
+  const outputStyles = [];
+  for (const file of files) {
+    try {
+      const target = workspacePath(root, file);
+      const info = await stat(target);
+      if (!info.isFile() || info.size > 512 * 1024) continue;
+      const content = await readFile(target, "utf8");
+      outputStyles.push({ ...normalizeOutputStyleMetadata(file, content), bytes: info.size });
+    } catch {
+      // Ignore unreadable output style files.
+    }
+  }
+  outputStyles.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return { outputStyles, count: outputStyles.length, root: ".oases/output-styles", truncated: files.length >= maxResults };
+}
+
+function validateOutputStylePath(stylePath) {
+  const normalized = String(stylePath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/output-styles/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("output_style_read can only read output style files under .oases/output-styles.");
+  }
+  if (!/\.(md|json)$/i.test(normalized)) throw new Error("output_style_read can only read Markdown or JSON output style files.");
+  return normalized;
+}
+
+async function readOutputStyle(root, body = {}) {
+  const requested = String(body.path || body.outputStyle || body.style || body.name || "").trim();
+  if (!requested) throw new Error("output_style_read requires path, outputStyle, style, or name.");
+  const outputStyles = await listOutputStyles(root, { maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = outputStyles.outputStyles.find((style) => (
+    style.path === requested
+    || style.name === requested
+    || style.title === requested
+    || style.id === requested
+  )) || outputStyles.outputStyles.find((style) => (
+    style.path.toLowerCase() === requestedLower
+    || style.name.toLowerCase() === requestedLower
+    || style.title.toLowerCase() === requestedLower
+    || style.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validateOutputStylePath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("output_style_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("output_style_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const outputStyle = normalizeOutputStyleMetadata(normalized, content);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const bodyPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    path: normalized,
+    bytes: info.size,
+    content: preview.text,
+    body: bodyPreview.text,
+    metadata: parsed.metadata,
+    outputStyle,
+    truncated: preview.truncated || bodyPreview.truncated,
+  };
+}
+
+async function listPluginOutputStyles(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(200, Number(body.maxResults) || 50));
+  const requestedPlugin = String(body.plugin || body.name || "").trim();
+  const requestedLower = requestedPlugin.toLowerCase();
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const includeDisabled = body.includeDisabled === true;
+  const selectedPlugins = plugins.plugins
+    .filter((plugin) => !requestedPlugin || matchesPluginRequest(plugin, requestedPlugin, requestedLower))
+    .filter((plugin) => includeDisabled || plugin.enabled !== false);
+  const outputStyles = [];
+  for (const plugin of selectedPlugins) {
+    for (const stylePath of plugin.outputStyles || []) {
+      if (outputStyles.length >= maxResults) break;
+      try {
+        const target = workspacePath(root, stylePath);
+        const info = await stat(target);
+        if (!info.isFile() || info.size > 512 * 1024) continue;
+        const content = await readFile(target, "utf8");
+        outputStyles.push({ ...normalizeOutputStyleMetadata(stylePath, content, plugin), bytes: info.size });
+      } catch {
+        // Ignore unreadable plugin output style files.
+      }
+    }
+    if (outputStyles.length >= maxResults) break;
+  }
+  outputStyles.sort((a, b) => a.plugin.localeCompare(b.plugin) || a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return {
+    outputStyles,
+    count: outputStyles.length,
+    plugin: requestedPlugin || undefined,
+    root: ".oases/plugins/*/output-styles",
+    truncated: outputStyles.length >= maxResults,
+  };
+}
+
+function validatePluginOutputStylePath(stylePath) {
+  const normalized = String(stylePath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/plugins/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("plugin_output_style_read can only read output style files under .oases/plugins.");
+  }
+  if (!normalized.includes("/output-styles/") || !/\.(md|json)$/i.test(normalized)) {
+    throw new Error("plugin_output_style_read can only read Markdown or JSON output style files under a plugin output-styles directory.");
+  }
+  return normalized;
+}
+
+async function readPluginOutputStyle(root, body = {}) {
+  const requested = String(body.path || body.outputStyle || body.style || body.name || "").trim();
+  if (!requested) throw new Error("plugin_output_style_read requires path, outputStyle, style, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const outputStyles = await listPluginOutputStyles(root, { plugin: pluginFilter, includeDisabled: body.includeDisabled === true, maxResults: 200 });
+  const requestedLower = requested.toLowerCase();
+  const matched = outputStyles.outputStyles.find((style) => (
+    style.path === requested
+    || style.name === requested
+    || style.title === requested
+    || style.id === requested
+  )) || outputStyles.outputStyles.find((style) => (
+    style.path.toLowerCase() === requestedLower
+    || style.name.toLowerCase() === requestedLower
+    || style.title.toLowerCase() === requestedLower
+    || style.id.toLowerCase() === requestedLower
+  ));
+  const normalized = validatePluginOutputStylePath(matched ? matched.path : requested);
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("plugin_output_style_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("plugin_output_style_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const pluginRoot = normalized.split("/output-styles/")[0];
+  const plugins = await listPlugins(root, { maxResults: 200 });
+  const plugin = plugins.plugins.find((item) => item.root === pluginRoot) || { name: path.basename(pluginRoot), id: path.basename(pluginRoot), root: pluginRoot };
+  const outputStyle = normalizeOutputStyleMetadata(normalized, content, plugin);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const bodyPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    path: normalized,
+    root: pluginRoot,
+    bytes: info.size,
+    content: preview.text,
+    body: bodyPreview.text,
+    metadata: parsed.metadata,
+    outputStyle,
+    plugin,
+    truncated: preview.truncated || bodyPreview.truncated,
+  };
+}
+
+async function installPluginOutputStyle(root, body = {}) {
+  const requested = String(body.path || body.outputStyle || body.style || body.name || "").trim();
+  if (!requested) throw new Error("plugin_output_style_install requires path, outputStyle, style, or name.");
+  const pluginFilter = String(body.plugin || "").trim();
+  const outputStyles = await listPluginOutputStyles(root, { plugin: pluginFilter, includeDisabled: body.includeDisabled === true, maxResults: 500 });
+  const requestedLower = requested.toLowerCase();
+  const sourceStyle = outputStyles.outputStyles.find((style) => (
+    style.path === requested
+    || style.name === requested
+    || style.title === requested
+    || style.id === requested
+  )) || outputStyles.outputStyles.find((style) => (
+    style.path.toLowerCase() === requestedLower
+    || style.name.toLowerCase() === requestedLower
+    || style.title.toLowerCase() === requestedLower
+    || style.id.toLowerCase() === requestedLower
+  ));
+  if (!sourceStyle) throw new Error(`Plugin output style not found: ${requested}`);
+  const sourceFile = workspacePath(root, validatePluginOutputStylePath(sourceStyle.path));
+  const sourceReal = await realpath(sourceFile);
+  const pluginRoot = await realpath(workspacePath(root, sourceStyle.pluginRoot));
+  if (!isPathInside(pluginRoot, sourceReal)) throw new Error("plugin_output_style_install source escapes the selected plugin directory.");
+  const defaultName = sourceStyle.name || path.basename(sourceStyle.path, path.extname(sourceStyle.path));
+  const normalizedTargetName = normalizeInstallName(body.targetName || defaultName, "plugin_output_style_install");
+  const sourceExt = path.extname(sourceStyle.path).toLowerCase() || ".md";
+  const targetFileName = /\.(md|json)$/i.test(normalizedTargetName) ? normalizedTargetName : `${normalizedTargetName}${sourceExt}`;
+  const targetRelativePath = `.oases/output-styles/${targetFileName}`;
+  await mkdir(workspacePath(root, ".oases/output-styles"), { recursive: true });
+  const targetFile = workspacePath(root, targetRelativePath);
+  if (await fileExists(targetFile)) throw new Error(`Workspace output style already exists: ${targetRelativePath}`);
+  await copyFile(sourceReal, targetFile);
+  const installedInfo = await stat(targetFile);
+  return {
+    installed: true,
+    name: path.basename(targetFileName, path.extname(targetFileName)),
+    sourceStyle,
+    sourcePlugin: sourceStyle.plugin,
+    path: targetRelativePath,
+    bytes: installedInfo.size,
+    artifacts: [{ type: "file", role: "installed_plugin_output_style", path: targetRelativePath, bytes: installedInfo.size }],
+  };
+}
+
 function normalizeAgentFileId(file) {
   const base = path.basename(file, path.extname(file));
   if (/^AGENT$/i.test(base)) return path.basename(path.dirname(file));
@@ -2129,6 +2654,8 @@ function normalizeAgentMetadata(file, metadata = {}) {
   const tools = parseCommaSeparatedList(metadata.tools);
   const disallowedTools = parseCommaSeparatedList(metadata.disallowedTools);
   const skills = parseCommaSeparatedList(metadata.skills);
+  const commands = parseCommaSeparatedList(metadata.commands);
+  const memories = parseCommaSeparatedList(metadata.memories);
   const initialPrompt = typeof metadata.initialPrompt === "string" && metadata.initialPrompt.trim()
     ? metadata.initialPrompt.trim()
     : undefined;
@@ -2145,6 +2672,8 @@ function normalizeAgentMetadata(file, metadata = {}) {
     ...(tools ? { tools } : {}),
     ...(disallowedTools ? { disallowedTools } : {}),
     ...(skills ? { skills } : {}),
+    ...(commands ? { commands } : {}),
+    ...(memories ? { memories } : {}),
     ...(initialPrompt ? { initialPrompt } : {}),
   };
 }
@@ -2699,6 +3228,46 @@ export const TOOL_REGISTRY = {
     inputSchema: { type: "object", required: ["url"], properties: { url: { type: "string" }, maxChars: { type: "number" } } },
     execute: (_root, body, options) => fetchUrl(body, options.signal),
   },
+  web_search: {
+    name: "web_search",
+    title: "Web search",
+    description: "Search the web using DuckDuckGo HTML API. Returns structured results with titles, URLs, and snippets. Use this for current information, news, documentation lookup, or fact-checking. No API key required.",
+    risk: "network",
+    inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" }, maxResults: { type: "number" } } },
+    execute: (_root, body, options) => webSearch(body, options.signal),
+  },
+  mcp_list: {
+    name: "mcp_list",
+    title: "List MCP server tools",
+    description: "List available tools from MCP servers configured in .oases/settings.json mcpServers. Returns tool names, descriptions, and input schemas from each server.",
+    risk: "read",
+    inputSchema: { type: "object", properties: {} },
+    execute: (root) => listMcpTools(root),
+  },
+  mcp_call: {
+    name: "mcp_call",
+    title: "Call MCP server tool",
+    description: "Call a tool on a configured MCP server. The server must be listed in .oases/settings.json mcpServers.",
+    risk: "network",
+    inputSchema: { type: "object", required: ["server", "tool"], properties: { server: { type: "string" }, tool: { type: "string" }, arguments: { type: "object" } } },
+    execute: (root, body) => callMcpTool(root, String(body.server || ""), String(body.tool || ""), body.arguments || {}),
+  },
+  mcp_resources_list: {
+    name: "mcp_resources_list",
+    title: "List MCP server resources",
+    description: "List available resources from configured MCP servers. Resources are data sources exposed by MCP servers.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { server: { type: "string", description: "Optional server name filter" } } },
+    execute: (root, body) => listMcpResources(root, body.server),
+  },
+  mcp_resource_read: {
+    name: "mcp_resource_read",
+    title: "Read MCP server resource",
+    description: "Read a specific resource from an MCP server by URI.",
+    risk: "read",
+    inputSchema: { type: "object", required: ["server", "uri"], properties: { server: { type: "string" }, uri: { type: "string" } } },
+    execute: (root, body) => readMcpResource(root, String(body.server || ""), String(body.uri || "")),
+  },
   run_command: {
     name: "run_command",
     title: "Run shell command",
@@ -2737,7 +3306,7 @@ export const TOOL_REGISTRY = {
   todo_write: {
     name: "todo_write",
     title: "Update task todos",
-    description: "Update the structured project task checklist for the current local agent session.",
+    description: "Update the structured project task checklist. Todos are persisted to .oases/todo.json in the workspace.",
     risk: "write",
     inputSchema: {
       type: "object",
@@ -2757,14 +3326,138 @@ export const TOOL_REGISTRY = {
         },
       },
     },
-    execute: async (_root, body) => {
+    execute: async (root, body) => {
       const todos = normalizeTodos(body);
       const counts = todos.reduce((acc, todo) => {
         acc[todo.status] = (acc[todo.status] || 0) + 1;
         return acc;
       }, {});
-      return { todos, count: todos.length, counts, summary: summarizeTodos(todos) };
+      // Persist to .oases/todo.json so todo_read and future sessions can load it
+      try {
+        const todoDir = workspacePath(root, ".oases");
+        await mkdir(todoDir, { recursive: true });
+        const todoPath = workspacePath(root, ".oases/todo.json");
+        await writeFile(todoPath, JSON.stringify({ todos, updatedAt: new Date().toISOString() }, null, 2) + "\n", "utf8");
+      } catch {
+        // Silent fallback: todo_write still returns results even if persistence fails
+      }
+      return { todos, count: todos.length, counts, summary: summarizeTodos(todos), persisted: true };
     },
+  },
+  todo_read: {
+    name: "todo_read",
+    title: "Read task todos",
+    description: "Read the current project task checklist from the workspace .oases/todo.json file.",
+    risk: "read",
+    inputSchema: { type: "object", properties: {} },
+    execute: async (root) => {
+      const todoPath = workspacePath(root, ".oases/todo.json");
+      try {
+        const fileContent = await readFile(todoPath, "utf8");
+        const parsed = JSON.parse(fileContent);
+        const todos = Array.isArray(parsed?.todos) ? parsed.todos : [];
+        const counts = todos.reduce((acc, todo) => {
+          const s = ["todo", "doing", "done"].includes(todo?.status) ? todo.status : "todo";
+          acc[s] = (acc[s] || 0) + 1;
+          return acc;
+        }, {});
+        return { todos, count: todos.length, counts, summary: summarizeTodos(todos), path: ".oases/todo.json" };
+      } catch (error) {
+        if (error?.code === "ENOENT") return { todos: [], count: 0, counts: {}, summary: "", note: "No .oases/todo.json found." };
+        throw error;
+      }
+    },
+  },
+  settings_list: {
+    name: "settings_list",
+    title: "List workspace settings",
+    description: "List project settings files under .oases and, when requested, .claude. Values are summarized by shape and sensitive keys are redacted; settings are not applied by this tool.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { includeClaude: { type: "boolean", description: "Also include Claude-style .claude/settings.json and .claude/settings.local.json for compatibility audits." } } },
+    execute: (root, body) => listWorkspaceSettings(root, body),
+  },
+  settings_read: {
+    name: "settings_read",
+    title: "Read workspace settings",
+    description: "Read a project settings file from .oases/settings.json or .oases/settings.local.json. With includeClaude, can also inspect .claude/settings.json or .claude/settings.local.json. Values are shape-only and sensitive keys are redacted.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, settings: { type: "string" }, path: { type: "string" }, includeClaude: { type: "boolean" } } },
+    execute: (root, body) => readWorkspaceSettings(root, body),
+  },
+  settings_write: {
+    name: "settings_write",
+    title: "Write workspace settings",
+    description: "Safely merge key/value pairs into .oases/settings.local.json (the local-only settings file). Sensitive keys like tokens and passwords are rejected. Only whitelisted top-level keys are accepted. The file is created if missing.",
+    risk: "write",
+    inputSchema: {
+      type: "object",
+      required: ["settings"],
+      properties: {
+        settings: {
+          type: "object",
+          description: "Key/value pairs to merge into settings.local.json. Allowed top-level keys: outputStyle, mcpServers, permissions, defaultMode, todoWrite, autoContinue.",
+        },
+        path: { type: "string", description: "Target settings path. Defaults to .oases/settings.local.json." },
+      },
+    },
+    execute: async (root, body) => {
+      const settingsPath = typeof body.path === "string" && body.path.trim() ? body.path.trim() : ".oases/settings.local.json";
+      if (!settingsPath.startsWith(".oases/") || (!settingsPath.endsWith("settings.json") && !settingsPath.endsWith("settings.local.json"))) {
+        throw new Error("settings_write can only write to .oases/settings.json or .oases/settings.local.json.");
+      }
+      const target = workspacePath(root, settingsPath);
+      // Verify resolved path stays within workspace
+      const resolvedTarget = path.resolve(target);
+      const resolvedRoot = path.resolve(root);
+      if (!resolvedTarget.startsWith(resolvedRoot + path.sep) && resolvedTarget !== resolvedRoot) {
+        throw new Error("settings_write target is outside workspace.");
+      }
+      const ALLOWED_KEYS = new Set(["outputStyle", "mcpServers", "permissions", "defaultMode", "autoContinue", "todoWrite"]);
+      const input = body.settings;
+      if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("settings_write requires a settings object.");
+      const merged = {};
+      for (const [key, value] of Object.entries(input)) {
+        if (SENSITIVE_KEY_RE.test(key)) throw new Error(`settings_write rejected sensitive key: ${key}`);
+        if (!ALLOWED_KEYS.has(key)) throw new Error(`settings_write rejected unknown key: ${key}. Allowed: ${[...ALLOWED_KEYS].join(", ")}`);
+        merged[key] = value;
+      }
+      let existing = {};
+      try {
+        existing = JSON.parse(await readFile(target, "utf8"));
+        if (!existing || typeof existing !== "object" || Array.isArray(existing)) existing = {};
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      const result = { ...existing, ...merged };
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, JSON.stringify(result, null, 2) + "\n", "utf8");
+      const changedKeys = Object.keys(merged);
+      return { path: settingsPath, changedKeys, merged: changedKeys.length, note: `Updated ${changedKeys.join(", ")} in ${settingsPath}` };
+    },
+  },
+  memory_list: {
+    name: "memory_list",
+    title: "List project memories",
+    description: "List project memory Markdown files under .oases/memory/project, .oases/memory/team, or .oases/memory/private. This only discovers memory metadata; it does not automatically apply memory.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["project", "team", "private"] }, maxResults: { type: "number" } } },
+    execute: (root, body) => listMemories(root, body),
+  },
+  memory_read: {
+    name: "memory_read",
+    title: "Read project memory",
+    description: "Read a Markdown memory file from .oases/memory. Use path, memory, or name; optional scope narrows the lookup.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, memory: { type: "string" }, path: { type: "string" }, scope: { type: "string", enum: ["project", "team", "private"] }, maxChars: { type: "number" } } },
+    execute: (root, body) => readMemory(root, body),
+  },
+  memory_write: {
+    name: "memory_write",
+    title: "Write project memory",
+    description: "Create or replace a Markdown memory file under .oases/memory/<scope>. Use this only when the user explicitly asks to remember/save project guidance or when preserving durable project context is clearly useful.",
+    risk: "write",
+    inputSchema: { type: "object", required: ["content"], properties: { name: { type: "string" }, title: { type: "string" }, description: { type: "string" }, content: { type: "string" }, body: { type: "string" }, scope: { type: "string", enum: ["project", "team", "private"] }, tags: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, path: { type: "string" }, overwrite: { type: "boolean" } } },
+    execute: (root, body) => writeMemory(root, body),
   },
   skill_list: {
     name: "skill_list",
@@ -2822,6 +3515,22 @@ export const TOOL_REGISTRY = {
     inputSchema: { type: "object", properties: { name: { type: "string" }, command: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
     execute: (root, body) => readCommand(root, body),
   },
+  output_style_list: {
+    name: "output_style_list",
+    title: "List workspace output styles",
+    description: "List workspace-local output style templates under .oases/output-styles. These are reusable response style instructions and are not executed by this tool.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { maxResults: { type: "number" } } },
+    execute: (root, body) => listOutputStyles(root, body),
+  },
+  output_style_read: {
+    name: "output_style_read",
+    title: "Read workspace output style",
+    description: "Read and explicitly load a workspace-local output style template under .oases/output-styles by name or relative path for the current agent session.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, outputStyle: { type: "string" }, style: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readOutputStyle(root, body),
+  },
   plugin_list: {
     name: "plugin_list",
     title: "List workspace plugins",
@@ -2877,6 +3586,30 @@ export const TOOL_REGISTRY = {
     risk: "write",
     inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, command: { type: "string" }, path: { type: "string" }, targetName: { type: "string" }, includeDisabled: { type: "boolean" } } },
     execute: (root, body) => installPluginCommand(root, body),
+  },
+  plugin_output_style_list: {
+    name: "plugin_output_style_list",
+    title: "List plugin output styles",
+    description: "List output style templates from workspace-local plugins under .oases/plugins/<plugin>/output-styles. This is read-only discovery; styles are not applied automatically.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, includeDisabled: { type: "boolean" }, maxResults: { type: "number" } } },
+    execute: (root, body) => listPluginOutputStyles(root, body),
+  },
+  plugin_output_style_read: {
+    name: "plugin_output_style_read",
+    title: "Read plugin output style",
+    description: "Read and explicitly load an output style template from a workspace-local plugin output-styles directory by plugin/name or relative path for the current agent session. This does not execute plugin code.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, outputStyle: { type: "string" }, style: { type: "string" }, path: { type: "string" }, includeDisabled: { type: "boolean" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readPluginOutputStyle(root, body),
+  },
+  plugin_output_style_install: {
+    name: "plugin_output_style_install",
+    title: "Install plugin output style",
+    description: "Copy an output style template from an installed workspace plugin into .oases/output-styles/<targetName> so it becomes a normal workspace output style.",
+    risk: "write",
+    inputSchema: { type: "object", properties: { plugin: { type: "string" }, name: { type: "string" }, outputStyle: { type: "string" }, style: { type: "string" }, path: { type: "string" }, targetName: { type: "string" }, includeDisabled: { type: "boolean" } } },
+    execute: (root, body) => installPluginOutputStyle(root, body),
   },
   plugin_hook_list: {
     name: "plugin_hook_list",

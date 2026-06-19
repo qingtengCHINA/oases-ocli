@@ -175,6 +175,46 @@ async function fetchPublicText(initialUrl, options = {}) {
   throw new Error("fetch_url followed too many redirects.");
 }
 
+
+export async function webSearch(body, signal) {
+  const query = String(body.query || "").trim();
+  if (!query) throw new Error("web_search requires a query.");
+  const maxResults = Math.max(1, Math.min(20, Number(body.maxResults) || 5));
+  const searchUrl = new URL("https://html.duckduckgo.com/html/");
+  searchUrl.searchParams.set("q", query);
+  const response = await fetchPublicText(searchUrl, { signal, maxBytes: 512 * 1024 });
+  const html = response.text;
+  const results = [];
+  // Parse DuckDuckGo HTML results
+  const resultRegex = /<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*(?:<[^>]*>[^<]*)*)<\/a>(?:[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?/gi;
+  for (const match of html.matchAll(resultRegex)) {
+    if (results.length >= maxResults) break;
+    const rawHref = match[1] || "";
+    const titleHtml = match[2] || "";
+    const snippetHtml = match[3] || "";
+    const title = stripTags(titleHtml).trim();
+    const snippet = stripTags(snippetHtml).trim();
+    let url = "";
+    try {
+      // DuckDuckGo HTML wraps real URL in a redirect; try to extract uddg param
+      const hrefObj = new URL(decodeHtmlEntities(rawHref), "https://duckduckgo.com");
+      const uddg = hrefObj.searchParams.get("uddg");
+      url = uddg ? decodeHtmlEntities(uddg) : hrefObj.toString();
+    } catch {
+      url = decodeHtmlEntities(rawHref);
+    }
+    if (!url || !title) continue;
+    results.push({ title, url, ...(snippet ? { snippet } : {}) });
+  }
+  return {
+    query,
+    resultCount: results.length,
+    results,
+    source: "duckduckgo",
+    note: results.length === 0 ? "No results found. Try a different query or check the search terms." : undefined,
+  };
+}
+
 export async function fetchUrl(body, signal) {
   const url = new URL(String(body.url || ""));
   const maxChars = Number.isFinite(body.maxChars) ? Math.max(1000, Math.min(200000, Number(body.maxChars))) : 80000;

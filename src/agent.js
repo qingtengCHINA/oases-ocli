@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getPermissionPolicy, getToolMetadata, handleTool, isProjectToolName, listOpenAiTools, shouldRequireApproval } from "./tools.js";
@@ -174,6 +174,42 @@ function buildSkillContextMessage(skills) {
   ].join("\n\n");
 }
 
+function buildOutputStyleContextMessage(outputStyles) {
+  if (!outputStyles.length) return "";
+  return [
+    "已加载以下 Oases 输出风格。接下来必须按这些输出风格组织回复；如果输出风格和用户要求冲突，以用户要求为准并说明取舍。",
+    ...outputStyles.map((style) => [
+      `<output_style_context name="${escapeXmlAttr(style.name || "style")}" path="${escapeXmlAttr(style.path || "")}" source="${escapeXmlAttr(style.source || "workspace")}" plugin="${escapeXmlAttr(style.plugin || "")}">`,
+      String(style.prompt || style.content || "").slice(0, 60000),
+      "</output_style_context>",
+    ].join("\n")),
+  ].join("\n\n");
+}
+
+function buildCommandContextMessage(commands) {
+  if (!commands.length) return "";
+  return [
+    "已加载以下 Oases 命令模板。接下来必须把这些命令模板当作当前任务的可复用工作流/提示约束执行；如果命令模板和用户要求冲突，以用户要求为准并说明取舍。",
+    ...commands.map((command) => [
+      `<command_context name="${escapeXmlAttr(command.name || "command")}" title="${escapeXmlAttr(command.title || "")}" path="${escapeXmlAttr(command.path || "")}" source="${escapeXmlAttr(command.source || "workspace")}" plugin="${escapeXmlAttr(command.plugin || "")}">`,
+      String(command.body || command.content || "").slice(0, 60000),
+      "</command_context>",
+    ].join("\n")),
+  ].join("\n\n");
+}
+
+function buildMemoryContextMessage(memories) {
+  if (!memories.length) return "";
+  return [
+    "已加载以下 Oases 项目记忆。接下来可以把这些记忆作为当前项目的持久上下文参考；如果记忆和用户要求或当前文件事实冲突，以用户要求和当前文件事实为准，并说明取舍。",
+    ...memories.map((memory) => [
+      `<memory_context name="${escapeXmlAttr(memory.name || "memory")}" title="${escapeXmlAttr(memory.title || "")}" path="${escapeXmlAttr(memory.path || "")}" scope="${escapeXmlAttr(memory.scope || "project")}" tags="${escapeXmlAttr(Array.isArray(memory.tags) ? memory.tags.join(",") : "")}">`,
+      String(memory.body || memory.content || "").slice(0, 60000),
+      "</memory_context>",
+    ].join("\n")),
+  ].join("\n\n");
+}
+
 function normalizeLoadedSkillData(data) {
   if (!data || typeof data !== "object") return undefined;
   const path = typeof data.path === "string" ? data.path : "";
@@ -196,6 +232,83 @@ function extractLoadedSkill(result) {
   return normalizeLoadedSkillData(result.data);
 }
 
+function normalizeLoadedOutputStyleData(data) {
+  if (!data || typeof data !== "object") return undefined;
+  const path = typeof data.path === "string" ? data.path : "";
+  const prompt = typeof data.body === "string" && data.body.trim()
+    ? data.body
+    : typeof data.content === "string" ? data.content : "";
+  if (!path || !prompt) return undefined;
+  const outputStyle = data.outputStyle && typeof data.outputStyle === "object" ? data.outputStyle : {};
+  return {
+    name: typeof outputStyle.name === "string" && outputStyle.name ? outputStyle.name : typeof outputStyle.id === "string" && outputStyle.id ? outputStyle.id : path.split("/").pop()?.replace(/\.(md|json)$/i, "") || "output-style",
+    title: typeof outputStyle.title === "string" ? outputStyle.title : "",
+    description: typeof outputStyle.description === "string" ? outputStyle.description : "",
+    path,
+    source: typeof outputStyle.source === "string" ? outputStyle.source : "workspace",
+    plugin: typeof outputStyle.plugin === "string" ? outputStyle.plugin : "",
+    prompt,
+  };
+}
+
+function extractLoadedOutputStyle(result) {
+  if (!["output_style_read", "plugin_output_style_read"].includes(result?.name) || result.ok === false || !result.data || typeof result.data !== "object") return undefined;
+  return normalizeLoadedOutputStyleData(result.data);
+}
+
+function normalizeLoadedCommandData(data, toolName) {
+  if (!data || typeof data !== "object") return undefined;
+  const path = typeof data.path === "string" ? data.path : "";
+  const body = typeof data.body === "string" && data.body.trim()
+    ? data.body
+    : typeof data.content === "string" ? data.content : "";
+  if (!path || !body) return undefined;
+  const command = data.command && typeof data.command === "object" ? data.command : {};
+  const plugin = data.plugin && typeof data.plugin === "object" ? data.plugin : {};
+  const source = toolName === "plugin_command_read" || command.source === "plugin" || plugin.name ? "plugin" : "workspace";
+  return {
+    name: typeof command.name === "string" && command.name ? command.name : typeof command.id === "string" && command.id ? command.id : path.split("/").pop()?.replace(/\.md$/i, "") || "command",
+    title: typeof command.title === "string" ? command.title : "",
+    description: typeof command.description === "string" ? command.description : "",
+    path,
+    source,
+    plugin: typeof command.plugin === "string" && command.plugin ? command.plugin : typeof plugin.name === "string" ? plugin.name : typeof plugin.id === "string" ? plugin.id : "",
+    body,
+    content: body,
+  };
+}
+
+function extractLoadedCommand(result) {
+  if (!["command_read", "plugin_command_read"].includes(result?.name) || result.ok === false || !result.data || typeof result.data !== "object") return undefined;
+  return normalizeLoadedCommandData(result.data, result.name);
+}
+
+function normalizeLoadedMemoryData(data) {
+  if (!data || typeof data !== "object") return undefined;
+  const path = typeof data.path === "string" ? data.path : "";
+  const body = typeof data.body === "string" && data.body.trim()
+    ? data.body
+    : typeof data.content === "string" ? data.content : "";
+  if (!path || !body) return undefined;
+  const memory = data.memory && typeof data.memory === "object" ? data.memory : {};
+  return {
+    name: typeof memory.name === "string" && memory.name ? memory.name : typeof data.name === "string" && data.name ? data.name : path.split("/").pop()?.replace(/\.md$/i, "") || "memory",
+    title: typeof memory.title === "string" && memory.title ? memory.title : typeof data.title === "string" ? data.title : "",
+    description: typeof memory.description === "string" && memory.description ? memory.description : typeof data.description === "string" ? data.description : "",
+    scope: typeof memory.scope === "string" && memory.scope ? memory.scope : typeof data.scope === "string" && data.scope ? data.scope : path.split("/")[2] || "project",
+    tags: Array.isArray(memory.tags) ? memory.tags.filter((item) => typeof item === "string" && item.trim()) : Array.isArray(data.tags) ? data.tags.filter((item) => typeof item === "string" && item.trim()) : [],
+    path,
+    body,
+    content: body,
+    metadata: data.metadata && typeof data.metadata === "object" ? data.metadata : {},
+  };
+}
+
+function extractLoadedMemory(result) {
+  if (result?.name !== "memory_read" || result.ok === false || !result.data || typeof result.data !== "object") return undefined;
+  return normalizeLoadedMemoryData(result.data);
+}
+
 async function loadWorkspaceSkills(root, skillNames = [], options = {}) {
   const loaded = [];
   const seen = new Set();
@@ -208,6 +321,296 @@ async function loadWorkspaceSkills(root, skillNames = [], options = {}) {
     if (skill) loaded.push(skill);
   }
   return loaded;
+}
+
+async function loadWorkspaceCommands(root, commandNames = [], options = {}) {
+  const loaded = [];
+  const seen = new Set();
+  for (const value of Array.isArray(commandNames) ? commandNames : []) {
+    const name = String(value || "").trim();
+    if (!name || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    const attempts = [
+      ["command_read", { name, maxChars: 60000 }],
+      ["plugin_command_read", { name, maxChars: 60000 }],
+    ];
+    for (const [toolName, args] of attempts) {
+      try {
+        const data = await handleTool(root, toolName, args, { signal: options.signal });
+        const command = normalizeLoadedCommandData(data, toolName);
+        if (command) {
+          loaded.push(command);
+          break;
+        }
+      } catch {
+        // Missing workspace commands are allowed; try plugin commands next.
+      }
+    }
+  }
+  return loaded;
+}
+
+async function loadWorkspaceMemories(root, memoryNames = [], options = {}) {
+  const loaded = [];
+  const seen = new Set();
+  for (const value of Array.isArray(memoryNames) ? memoryNames : []) {
+    const raw = String(value || "").trim();
+    if (!raw || seen.has(raw.toLowerCase())) continue;
+    seen.add(raw.toLowerCase());
+    const [maybeScope, ...rest] = raw.includes(":") ? raw.split(":") : ["", raw];
+    const requested = rest.join(":").trim();
+    const args = raw.startsWith(".oases/memory/")
+      ? { path: raw, maxChars: 60000 }
+      : ["project", "team", "private"].includes(maybeScope)
+        ? { scope: maybeScope, name: requested, maxChars: 60000 }
+        : { name: raw, maxChars: 60000 };
+    const data = await handleTool(root, "memory_read", args, { signal: options.signal });
+    const memory = normalizeLoadedMemoryData(data);
+    if (memory) loaded.push(memory);
+  }
+  return loaded;
+}
+
+async function readWorkspaceOutputStyleSetting(root) {
+  const candidates = [".oases/settings.json", ".oases/settings.local.json"];
+  let selected;
+  for (const relativePath of candidates) {
+    try {
+      const content = await readFile(path.join(root, relativePath), "utf8");
+      const parsed = tryParseJson(content);
+      const outputStyle = typeof parsed?.outputStyle === "string" ? parsed.outputStyle.trim() : "";
+      if (outputStyle) selected = { name: outputStyle, path: relativePath };
+    } catch {
+      // Missing or unreadable project settings are normal.
+    }
+  }
+  return selected;
+}
+
+async function readWorkspaceSettingsJsonFiles(root) {
+  const candidates = [".oases/settings.json", ".oases/settings.local.json"];
+  const files = [];
+  for (const relativePath of candidates) {
+    try {
+      const content = await readFile(path.join(root, relativePath), "utf8");
+      const parsed = tryParseJson(content);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) files.push({ path: relativePath, settings: parsed });
+    } catch {
+      // Missing or unreadable project settings are normal.
+    }
+  }
+  return files;
+}
+
+function findFirstUnescapedChar(value, char) {
+  const source = String(value || "");
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] !== char) continue;
+    let backslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && source[cursor] === "\\"; cursor -= 1) backslashes += 1;
+    if (backslashes % 2 === 0) return index;
+  }
+  return -1;
+}
+
+function findLastUnescapedChar(value, char) {
+  const source = String(value || "");
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    if (source[index] !== char) continue;
+    let backslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && source[cursor] === "\\"; cursor -= 1) backslashes += 1;
+    if (backslashes % 2 === 0) return index;
+  }
+  return -1;
+}
+
+function normalizePermissionToolName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  const legacyMap = {
+    bash: "run_command",
+    shell: "run_command",
+    runcommand: "run_command",
+    run_command: "run_command",
+    python: "run_python",
+    runpython: "run_python",
+    run_python: "run_python",
+    read: "read_file",
+    readfile: "read_file",
+    read_file: "read_file",
+    write: "write_file",
+    writefile: "write_file",
+    write_file: "write_file",
+    edit: "edit_file",
+    editfile: "edit_file",
+    edit_file: "edit_file",
+    delete: "delete_file",
+    deletefile: "delete_file",
+    delete_file: "delete_file",
+    webfetch: "fetch_url",
+    fetch: "fetch_url",
+    fetch_url: "fetch_url",
+    glob: "glob_files",
+    globfiles: "glob_files",
+    glob_files: "glob_files",
+    grep: "grep_files",
+    grepfiles: "grep_files",
+    grep_files: "grep_files",
+    ls: "list_files",
+    list: "list_files",
+    listfiles: "list_files",
+    list_files: "list_files",
+    todowrite: "todo_write",
+    todo_write: "todo_write",
+    task: "agent_run",
+    agent: "agent_run",
+    agentrun: "agent_run",
+    agent_run: "agent_run",
+  };
+  return legacyMap[lower] || raw;
+}
+
+function parsePermissionRule(rawRule, sourcePath) {
+  const rule = String(rawRule || "").trim();
+  if (!rule) return undefined;
+  const openIndex = findFirstUnescapedChar(rule, "(");
+  const closeIndex = findLastUnescapedChar(rule, ")");
+  if (openIndex === -1 || closeIndex <= openIndex || closeIndex !== rule.length - 1) {
+    const toolName = normalizePermissionToolName(rule);
+    return toolName ? { raw: rule, toolName, sourcePath } : undefined;
+  }
+  const toolName = normalizePermissionToolName(rule.slice(0, openIndex));
+  const rawContent = rule.slice(openIndex + 1, closeIndex);
+  const ruleContent = rawContent === "*" ? "" : rawContent.replace(/\\([()])/g, "$1").trim();
+  return toolName ? { raw: rule, toolName, ruleContent, sourcePath } : undefined;
+}
+
+async function readWorkspacePermissionDenyRules(root) {
+  const files = await readWorkspaceSettingsJsonFiles(root);
+  const denied = [];
+  for (const file of files) {
+    const rules = Array.isArray(file.settings?.permissions?.deny) ? file.settings.permissions.deny : [];
+    for (const rawRule of rules) {
+      const parsed = parsePermissionRule(rawRule, file.path);
+      if (parsed) denied.push(parsed);
+    }
+  }
+  return denied;
+}
+
+async function readWorkspacePermissionAskRules(root) {
+  const files = await readWorkspaceSettingsJsonFiles(root);
+  const asked = [];
+  for (const file of files) {
+    const rules = Array.isArray(file.settings?.permissions?.ask) ? file.settings.permissions.ask : [];
+    for (const rawRule of rules) {
+      const parsed = parsePermissionRule(rawRule, file.path);
+      if (parsed) asked.push(parsed);
+    }
+  }
+  return asked;
+}
+
+async function readWorkspacePermissionAllowRules(root) {
+  const files = await readWorkspaceSettingsJsonFiles(root);
+  const allowed = [];
+  for (const file of files) {
+    // Only local project settings can reduce approval prompts. Committed project
+    // settings may deny or ask, but should not silently broaden execution.
+    if (file.path !== ".oases/settings.local.json") continue;
+    const rules = Array.isArray(file.settings?.permissions?.allow) ? file.settings.permissions.allow : [];
+    for (const rawRule of rules) {
+      const parsed = parsePermissionRule(rawRule, file.path);
+      if (parsed) allowed.push(parsed);
+    }
+  }
+  return allowed;
+}
+
+async function readWorkspacePermissionDefaultMode(root, options = {}) {
+  const files = await readWorkspaceSettingsJsonFiles(root);
+  let selected;
+  for (const file of files) {
+    const mode = typeof file.settings?.permissions?.defaultMode === "string"
+      ? file.settings.permissions.defaultMode.trim()
+      : "";
+    if (!mode) continue;
+    if (["default", "plan", "dontAsk"].includes(mode)) {
+      selected = { mode, path: file.path };
+      continue;
+    }
+    options.onEvent?.({
+      type: "settings_warning",
+      setting: "permissions.defaultMode",
+      path: file.path,
+      value: mode,
+      summary: `ocli 暂不支持 settings permissions.defaultMode=${mode}`,
+    });
+  }
+  return selected;
+}
+
+function permissionRuleArgumentText(toolName, args = {}) {
+  if (toolName === "run_command") return String(args.command || "");
+  if (toolName === "run_python") return String(args.script || "");
+  if (["read_file", "write_file", "edit_file", "delete_file"].includes(toolName)) return String(args.path || "");
+  if (toolName === "fetch_url") return String(args.url || "");
+  if (toolName === "agent_run") return [args.agentName, args.agent, args.description, args.task].filter(Boolean).join(" ");
+  return JSON.stringify(args || {});
+}
+
+function permissionRuleMatchesTool(rule, toolName, args = {}) {
+  if (!rule || rule.toolName !== toolName) return false;
+  if (!rule.ruleContent) return true;
+  const haystack = permissionRuleArgumentText(toolName, args).toLowerCase();
+  return haystack.includes(String(rule.ruleContent).toLowerCase());
+}
+
+function toolWideDeniedNames(rules = []) {
+  return [...new Set(rules.filter((rule) => rule?.toolName && !rule.ruleContent).map((rule) => rule.toolName))];
+}
+
+function toolWideAskedNames(rules = []) {
+  return [...new Set(rules.filter((rule) => rule?.toolName && !rule.ruleContent).map((rule) => rule.toolName))];
+}
+
+function toolWideAllowedNames(rules = []) {
+  return [...new Set(rules.filter((rule) => rule?.toolName && !rule.ruleContent).map((rule) => rule.toolName))];
+}
+
+function planModeAllowsTool(toolName) {
+  if (toolName === "todo_write") return true;
+  const risk = getToolMetadata(toolName)?.risk || "unknown";
+  return ["read", "network"].includes(risk);
+}
+
+async function loadOutputStyleFromSettings(root, options = {}) {
+  const setting = await readWorkspaceOutputStyleSetting(root);
+  if (!setting?.name) return undefined;
+  const attempts = [
+    ["output_style_read", { name: setting.name, maxChars: 60000 }],
+    ["plugin_output_style_read", { name: setting.name, maxChars: 60000 }],
+  ];
+  const errors = [];
+  for (const [toolName, args] of attempts) {
+    try {
+      const data = await handleTool(root, toolName, args, { signal: options.signal });
+      const style = normalizeLoadedOutputStyleData(data);
+      if (style) return { ...style, settingPath: setting.path, settingsOutputStyle: setting.name };
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  options.onEvent?.({
+    type: "settings_warning",
+    setting: "outputStyle",
+    path: setting.path,
+    value: setting.name,
+    summary: `ocli 未找到 settings outputStyle: ${setting.name}`,
+    errors,
+  });
+  return undefined;
 }
 
 function projectResponseLooksUnfinished(content) {
@@ -246,6 +649,8 @@ async function loadCustomAgentDefinition(root, args = {}, options = {}) {
     tools: Array.isArray(agent.tools) ? agent.tools : undefined,
     disallowedTools: Array.isArray(agent.disallowedTools) ? agent.disallowedTools : undefined,
     skills: Array.isArray(agent.skills) ? agent.skills : undefined,
+    commands: Array.isArray(agent.commands) ? agent.commands : undefined,
+    memories: Array.isArray(agent.memories) ? agent.memories : undefined,
     initialPrompt: typeof agent.initialPrompt === "string" && agent.initialPrompt.trim() ? agent.initialPrompt.trim() : undefined,
     prompt: typeof data?.prompt === "string" && data.prompt.trim() ? data.prompt.trim() : typeof data?.content === "string" ? data.content.trim() : "",
   };
@@ -302,6 +707,8 @@ function normalizeSubAgentRequest(args = {}, customAgent) {
         ...(customAgent.tools ? { tools: customAgent.tools } : {}),
         ...(customAgent.disallowedTools ? { disallowedTools: customAgent.disallowedTools } : {}),
         ...(customAgent.skills ? { skills: customAgent.skills } : {}),
+        ...(customAgent.commands ? { commands: customAgent.commands } : {}),
+        ...(customAgent.memories ? { memories: customAgent.memories } : {}),
         ...(customAgent.initialPrompt ? { initialPrompt: customAgent.initialPrompt } : {}),
       },
       customAgentPrompt: customAgent.prompt,
@@ -315,6 +722,12 @@ function assertToolAllowedForRun(toolName, body) {
   const disallowedToolNames = Array.isArray(body.disallowedToolNames) ? new Set(body.disallowedToolNames) : undefined;
   if (disallowedToolNames?.has(toolName) || (allowedToolNames && !allowedToolNames.has(toolName))) {
     throw new Error(`Tool ${toolName} is not allowed for this sub-agent.`);
+  }
+  const deniedRule = Array.isArray(body.settingsDeniedToolRules)
+    ? body.settingsDeniedToolRules.find((rule) => permissionRuleMatchesTool(rule, toolName, body.currentToolArguments || {}))
+    : undefined;
+  if (deniedRule) {
+    throw new Error(`Tool ${toolName} is denied by ${deniedRule.sourcePath} permissions.deny rule: ${deniedRule.raw}`);
   }
 }
 
@@ -437,6 +850,8 @@ async function runSubAgentCore(root, request, id, parent, options, parentTurn, w
     allowedToolNames: request.allowedToolNames,
     disallowedToolNames: request.disallowedToolNames,
     preloadedSkills: request.preloadedSkills,
+    preloadedCommands: request.preloadedCommands,
+    preloadedMemories: request.preloadedMemories,
   }, {
     signal: options.signal,
     subAgentDepth: (options.subAgentDepth || 0) + 1,
@@ -475,6 +890,9 @@ async function runSubAgentCore(root, request, id, parent, options, parentTurn, w
     toolResults: result.toolResults || [],
     ...(workspaceStatus ? { workspaceStatus } : {}),
     ...(result.invokedSkills ? { invokedSkills: result.invokedSkills } : {}),
+    ...(result.activeCommands ? { activeCommands: result.activeCommands } : {}),
+    ...(result.activeOutputStyles ? { activeOutputStyles: result.activeOutputStyles } : {}),
+    ...(result.activeMemories ? { activeMemories: result.activeMemories } : {}),
     ...(artifacts.length ? { artifacts } : {}),
   };
   return data;
@@ -485,6 +903,12 @@ async function startSubAgent(root, args, parent, options, parentTurn) {
   const request = normalizeSubAgentRequest(args, customAgent);
   if (Array.isArray(customAgent?.skills) && customAgent.skills.length) {
     request.preloadedSkills = await loadWorkspaceSkills(root, customAgent.skills, options);
+  }
+  if (Array.isArray(customAgent?.commands) && customAgent.commands.length) {
+    request.preloadedCommands = await loadWorkspaceCommands(root, customAgent.commands, options);
+  }
+  if (Array.isArray(customAgent?.memories) && customAgent.memories.length) {
+    request.preloadedMemories = await loadWorkspaceMemories(root, customAgent.memories, options);
   }
   const id = `sub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
   const workspace = await prepareSubAgentWorkspace(root, request, id, options);
@@ -644,11 +1068,45 @@ export async function runAgent(root, body, options = {}) {
   const workingMessages = [...messages];
   const toolResults = [];
   const invokedSkills = [];
+  const activeCommands = [];
+  const activeOutputStyles = [];
+  const activeMemories = [];
   const loadedSkillPaths = new Set();
+  const loadedCommandPaths = new Set();
+  const loadedOutputStylePaths = new Set();
+  const loadedMemoryPaths = new Set();
+  const settingsDeniedToolRules = await readWorkspacePermissionDenyRules(root);
+  const settingsAskToolRules = await readWorkspacePermissionAskRules(root);
+  const settingsAllowedToolRules = await readWorkspacePermissionAllowRules(root);
+  const settingsDefaultMode = await readWorkspacePermissionDefaultMode(root, options);
+  const settingsToolWideDeniedNames = toolWideDeniedNames(settingsDeniedToolRules);
+  const settingsToolWideAskNames = toolWideAskedNames(settingsAskToolRules);
+  const settingsToolWideAllowNames = toolWideAllowedNames(settingsAllowedToolRules);
   const backgroundSubAgents = new Map();
   let finalText = "";
   let stoppedReason = "completed";
   let autoContinuationCount = 0;
+
+  if (settingsDeniedToolRules.length || settingsAskToolRules.length || settingsAllowedToolRules.length || settingsDefaultMode?.mode) {
+    options.onEvent?.({
+      type: "settings_permissions_loaded",
+      turn: -1,
+      permissions: {
+        denyCount: settingsDeniedToolRules.length,
+        askCount: settingsAskToolRules.length,
+        allowCount: settingsAllowedToolRules.length,
+        defaultMode: settingsDefaultMode?.mode || "default",
+        defaultModePath: settingsDefaultMode?.path || "",
+        deniedTools: [...new Set(settingsDeniedToolRules.map((rule) => rule.toolName))],
+        askedTools: [...new Set(settingsAskToolRules.map((rule) => rule.toolName))],
+        allowedTools: [...new Set(settingsAllowedToolRules.map((rule) => rule.toolName))],
+        toolWideDenied: settingsToolWideDeniedNames,
+        toolWideAsk: settingsToolWideAskNames,
+        toolWideAllow: settingsToolWideAllowNames,
+      },
+      summary: `ocli 已加载项目权限规则：deny ${settingsDeniedToolRules.length} 条，ask ${settingsAskToolRules.length} 条，allow ${settingsAllowedToolRules.length} 条，defaultMode ${settingsDefaultMode?.mode || "default"}`,
+    });
+  }
 
   const preloadedSkills = Array.isArray(body.preloadedSkills)
     ? body.preloadedSkills.filter((skill) => skill && typeof skill === "object" && typeof skill.path === "string" && typeof skill.content === "string")
@@ -661,6 +1119,91 @@ export async function runAgent(root, body, options = {}) {
     const skillMetadata = { name: skill.name, description: skill.description || "", path: skill.path, source: skill.source || "workspace", root: skill.root || "" };
     invokedSkills.push(skillMetadata);
     options.onEvent?.({ type: "skill_loaded", turn: -1, skill: skillMetadata, preloaded: true, summary: `ocli 已预加载技能 ${skill.name}` });
+  }
+
+  const preloadedCommands = Array.isArray(body.preloadedCommands)
+    ? body.preloadedCommands
+        .map((command) => {
+          if (!command || typeof command !== "object" || typeof command.path !== "string") return undefined;
+          const bodyText = typeof command.body === "string" && command.body.trim()
+            ? command.body
+            : typeof command.content === "string" ? command.content : "";
+          return normalizeLoadedCommandData({
+            path: command.path,
+            body: bodyText,
+            content: bodyText,
+            command,
+            plugin: command.plugin ? { name: command.plugin } : undefined,
+          }, command.source === "plugin" ? "plugin_command_read" : "command_read");
+        })
+        .filter(Boolean)
+    : [];
+  const preloadedCommandContextMessage = buildCommandContextMessage(preloadedCommands);
+  if (preloadedCommandContextMessage) workingMessages.push({ role: "user", content: preloadedCommandContextMessage });
+  for (const command of preloadedCommands) {
+    if (loadedCommandPaths.has(command.path)) continue;
+    loadedCommandPaths.add(command.path);
+    const commandMetadata = {
+      name: command.name || "command",
+      title: command.title || "",
+      description: command.description || "",
+      path: command.path,
+      source: command.source || "workspace",
+      plugin: command.plugin || "",
+    };
+    activeCommands.push(commandMetadata);
+    options.onEvent?.({ type: "command_loaded", turn: -1, command: commandMetadata, preloaded: true, summary: `ocli 已预加载命令模板 ${commandMetadata.name}` });
+  }
+
+  const preloadedOutputStyles = Array.isArray(body.preloadedOutputStyles)
+    ? body.preloadedOutputStyles.filter((style) => style && typeof style === "object" && typeof style.path === "string" && (typeof style.prompt === "string" || typeof style.content === "string"))
+    : [];
+  const preloadedOutputStyleContextMessage = buildOutputStyleContextMessage(preloadedOutputStyles);
+  if (preloadedOutputStyleContextMessage) workingMessages.push({ role: "user", content: preloadedOutputStyleContextMessage });
+  for (const style of preloadedOutputStyles) {
+    if (loadedOutputStylePaths.has(style.path)) continue;
+    loadedOutputStylePaths.add(style.path);
+    const styleMetadata = { name: style.name || "output-style", title: style.title || "", description: style.description || "", path: style.path, source: style.source || "workspace", plugin: style.plugin || "" };
+    activeOutputStyles.push(styleMetadata);
+    options.onEvent?.({ type: "output_style_loaded", turn: -1, outputStyle: styleMetadata, preloaded: true, summary: `ocli 已预加载输出风格 ${styleMetadata.name}` });
+  }
+
+  const preloadedMemories = Array.isArray(body.preloadedMemories)
+    ? body.preloadedMemories.map(normalizeLoadedMemoryData).filter(Boolean)
+    : [];
+  const preloadedMemoryContextMessage = buildMemoryContextMessage(preloadedMemories);
+  if (preloadedMemoryContextMessage) workingMessages.push({ role: "user", content: preloadedMemoryContextMessage });
+  for (const memory of preloadedMemories) {
+    if (loadedMemoryPaths.has(memory.path)) continue;
+    loadedMemoryPaths.add(memory.path);
+    const memoryMetadata = { name: memory.name, title: memory.title || "", description: memory.description || "", path: memory.path, scope: memory.scope || "project", tags: memory.tags || [] };
+    activeMemories.push(memoryMetadata);
+    options.onEvent?.({ type: "memory_loaded", turn: -1, memory: memoryMetadata, preloaded: true, summary: `ocli 已预加载项目记忆 ${memoryMetadata.name}` });
+  }
+
+  const settingsOutputStyle = preloadedOutputStyles.length ? undefined : await loadOutputStyleFromSettings(root, options);
+  if (settingsOutputStyle && !loadedOutputStylePaths.has(settingsOutputStyle.path)) {
+    loadedOutputStylePaths.add(settingsOutputStyle.path);
+    const styleMetadata = {
+      name: settingsOutputStyle.name || "output-style",
+      title: settingsOutputStyle.title || "",
+      description: settingsOutputStyle.description || "",
+      path: settingsOutputStyle.path,
+      source: settingsOutputStyle.source || "workspace",
+      plugin: settingsOutputStyle.plugin || "",
+      settingPath: settingsOutputStyle.settingPath || "",
+      settingsOutputStyle: settingsOutputStyle.settingsOutputStyle || "",
+    };
+    activeOutputStyles.push(styleMetadata);
+    workingMessages.push({ role: "user", content: buildOutputStyleContextMessage([settingsOutputStyle]) });
+    options.onEvent?.({
+      type: "output_style_loaded",
+      turn: -1,
+      outputStyle: styleMetadata,
+      preloaded: true,
+      settings: true,
+      summary: `ocli 已按项目设置加载输出风格 ${styleMetadata.name}`,
+    });
   }
 
   for (let turn = 0; turn < maxTurns; turn += 1) {
@@ -677,7 +1220,10 @@ export async function runAgent(root, body, options = {}) {
         tools: listOpenAiTools({
           includeAgentRun: subAgentDepth < 1,
           allowedToolNames: body.allowedToolNames,
-          disallowedToolNames: body.disallowedToolNames,
+          disallowedToolNames: [
+            ...(Array.isArray(body.disallowedToolNames) ? body.disallowedToolNames : []),
+            ...settingsToolWideDeniedNames,
+          ],
         }),
         tool_choice: "auto",
       }),
@@ -708,7 +1254,7 @@ export async function runAgent(root, body, options = {}) {
     for (const call of calls) {
       options.onEvent?.({ type: "tool_start", turn, tool: call.name, arguments: call.arguments || {}, summary: summarizeToolCall(call) });
       try {
-        assertToolAllowedForRun(call.name, body);
+        assertToolAllowedForRun(call.name, { ...body, settingsDeniedToolRules, currentToolArguments: call.arguments || {} });
         if (call.name === "agent_run") {
           if (subAgentDepth >= 1) throw new Error("agent_run cannot be called from a nested sub-agent.");
           const { request, record } = await startSubAgent(root, call.arguments || {}, { apiBaseUrl, model, systemPrompt, effort: body.effort || "high" }, options, turn);
@@ -748,8 +1294,35 @@ export async function runAgent(root, body, options = {}) {
           options.onEvent?.({ type: "tool_result", turn, result });
           continue;
         }
-        if (shouldRequireApproval(call.name, call.arguments || {})) {
-          const policy = getPermissionPolicy(call.name, call.arguments || {});
+        const settingsAskRule = settingsAskToolRules.find((rule) => permissionRuleMatchesTool(rule, call.name, call.arguments || {}));
+        const settingsAllowRule = settingsAskRule
+          ? undefined
+          : settingsAllowedToolRules.find((rule) => permissionRuleMatchesTool(rule, call.name, call.arguments || {}));
+        if (settingsDefaultMode?.mode === "plan" && !planModeAllowsTool(call.name)) {
+          throw new Error(`Tool ${call.name} is blocked by ${settingsDefaultMode.path} permissions.defaultMode=plan.`);
+        }
+        const defaultPolicy = (settingsAskRule || settingsAllowRule) ? undefined : getPermissionPolicy(call.name, call.arguments || {});
+        const policy = settingsAskRule
+          ? {
+              requiresApproval: true,
+              category: "settings_permission_ask",
+              reason: `项目 ${settingsAskRule.sourcePath} permissions.ask 要求确认此工具调用：${settingsAskRule.raw}`,
+            }
+          : defaultPolicy;
+        if (settingsDefaultMode?.mode === "dontAsk" && !settingsAllowRule && (settingsAskRule || policy?.requiresApproval || shouldRequireApproval(call.name, call.arguments || {}))) {
+          throw new Error(`Tool ${call.name} requires approval and is denied by ${settingsDefaultMode.path} permissions.defaultMode=dontAsk.`);
+        }
+        if (settingsAllowRule) {
+          options.onEvent?.({
+            type: "settings_permission_allowed",
+            turn,
+            tool: call.name,
+            arguments: call.arguments || {},
+            rule: { raw: settingsAllowRule.raw, sourcePath: settingsAllowRule.sourcePath, toolName: settingsAllowRule.toolName, ruleContent: settingsAllowRule.ruleContent || "" },
+            summary: `项目 ${settingsAllowRule.sourcePath} permissions.allow 已允许 ${call.name}`,
+          });
+        }
+        if (policy?.requiresApproval || (!settingsAskRule && !settingsAllowRule && shouldRequireApproval(call.name, call.arguments || {}))) {
           const approval = await options.requestApproval?.({
             turn,
             tool: call.name,
@@ -800,10 +1373,24 @@ export async function runAgent(root, body, options = {}) {
                         ? `ocli 已读取技能资源 ${path || call.arguments?.assetPath || call.arguments?.file || "文件"}`
                     : call.name === "skill_install"
                         ? `ocli 已安装技能 ${data?.name || call.arguments?.targetName || call.arguments?.name || ""}`.trim()
+                    : call.name === "settings_list"
+                        ? "ocli 已列出项目设置"
+                    : call.name === "settings_read"
+                        ? `ocli 已读取项目设置 ${path || call.arguments?.path || call.arguments?.name || "settings.json"}`
+                    : call.name === "memory_list"
+                        ? "ocli 已列出项目记忆"
+                    : call.name === "memory_read"
+                        ? `ocli 已读取项目记忆 ${path || call.arguments?.memory || call.arguments?.name || "memory"}`
+                    : call.name === "memory_write"
+                        ? `ocli 已写入项目记忆 ${path || call.arguments?.name || call.arguments?.title || "memory"}`
                     : call.name === "command_list"
                         ? "ocli 已列出工作区命令"
                     : call.name === "command_read"
                         ? `ocli 已读取工作区命令 ${path || call.arguments?.command || call.arguments?.name || "文件"}`
+                    : call.name === "output_style_list"
+                        ? "ocli 已列出输出风格"
+                    : call.name === "output_style_read"
+                        ? `ocli 已读取输出风格 ${path || call.arguments?.outputStyle || call.arguments?.style || call.arguments?.name || "文件"}`
                     : call.name === "plugin_list"
                         ? "ocli 已列出工作区插件"
                     : call.name === "plugin_read"
@@ -818,6 +1405,12 @@ export async function runAgent(root, body, options = {}) {
                         ? `ocli 已读取插件命令 ${path || call.arguments?.command || call.arguments?.name || "文件"}`
                     : call.name === "plugin_command_install"
                         ? `ocli 已安装插件命令 ${data?.name || call.arguments?.targetName || call.arguments?.command || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_output_style_list"
+                        ? `ocli 已列出插件输出风格 ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
+                    : call.name === "plugin_output_style_read"
+                        ? `ocli 已读取插件输出风格 ${path || call.arguments?.outputStyle || call.arguments?.style || call.arguments?.name || "文件"}`
+                    : call.name === "plugin_output_style_install"
+                        ? `ocli 已安装插件输出风格 ${data?.name || call.arguments?.targetName || call.arguments?.outputStyle || call.arguments?.style || call.arguments?.name || ""}`.trim()
                     : call.name === "plugin_hook_list"
                         ? `ocli 已列出插件 Hook ${call.arguments?.plugin || call.arguments?.name || ""}`.trim()
                     : call.name === "plugin_hook_read"
@@ -873,6 +1466,63 @@ export async function runAgent(root, body, options = {}) {
     }
     const skillContextMessage = buildSkillContextMessage(newlyLoadedSkills);
     if (skillContextMessage) workingMessages.push({ role: "user", content: skillContextMessage });
+    const newlyLoadedCommands = [];
+    for (const result of turnResults) {
+      const command = extractLoadedCommand(result);
+      if (!command || loadedCommandPaths.has(command.path)) continue;
+      loadedCommandPaths.add(command.path);
+      const commandMetadata = {
+        name: command.name,
+        title: command.title || "",
+        description: command.description || "",
+        path: command.path,
+        source: command.source || "workspace",
+        plugin: command.plugin || "",
+      };
+      activeCommands.push(commandMetadata);
+      newlyLoadedCommands.push(command);
+      options.onEvent?.({ type: "command_loaded", turn, command: commandMetadata, summary: `ocli 已加载命令模板 ${command.name}` });
+    }
+    const commandContextMessage = buildCommandContextMessage(newlyLoadedCommands);
+    if (commandContextMessage) workingMessages.push({ role: "user", content: commandContextMessage });
+    const newlyLoadedOutputStyles = [];
+    for (const result of turnResults) {
+      const outputStyle = extractLoadedOutputStyle(result);
+      if (!outputStyle || loadedOutputStylePaths.has(outputStyle.path)) continue;
+      loadedOutputStylePaths.add(outputStyle.path);
+      const styleMetadata = {
+        name: outputStyle.name,
+        title: outputStyle.title || "",
+        description: outputStyle.description || "",
+        path: outputStyle.path,
+        source: outputStyle.source || "workspace",
+        plugin: outputStyle.plugin || "",
+      };
+      activeOutputStyles.push(styleMetadata);
+      newlyLoadedOutputStyles.push(outputStyle);
+      options.onEvent?.({ type: "output_style_loaded", turn, outputStyle: styleMetadata, summary: `ocli 已加载输出风格 ${outputStyle.name}` });
+    }
+    const outputStyleContextMessage = buildOutputStyleContextMessage(newlyLoadedOutputStyles);
+    if (outputStyleContextMessage) workingMessages.push({ role: "user", content: outputStyleContextMessage });
+    const newlyLoadedMemories = [];
+    for (const result of turnResults) {
+      const memory = extractLoadedMemory(result);
+      if (!memory || loadedMemoryPaths.has(memory.path)) continue;
+      loadedMemoryPaths.add(memory.path);
+      const memoryMetadata = {
+        name: memory.name,
+        title: memory.title || "",
+        description: memory.description || "",
+        path: memory.path,
+        scope: memory.scope || "project",
+        tags: memory.tags || [],
+      };
+      activeMemories.push(memoryMetadata);
+      newlyLoadedMemories.push(memory);
+      options.onEvent?.({ type: "memory_loaded", turn, memory: memoryMetadata, summary: `ocli 已加载项目记忆 ${memory.name}` });
+    }
+    const memoryContextMessage = buildMemoryContextMessage(newlyLoadedMemories);
+    if (memoryContextMessage) workingMessages.push({ role: "user", content: memoryContextMessage });
     if ((turn + 1) % maxTurnsPerSlice === 0 && turn + 1 < maxTurns) {
       autoContinuationCount += 1;
       workingMessages.push({ role: "user", content: buildAgentContinuationPrompt(autoContinuationCount) });
@@ -883,7 +1533,30 @@ export async function runAgent(root, body, options = {}) {
     stoppedReason = "max_turns";
   }
 
-  return { finalText: finalText || "工程任务已完成，但没有可显示的回复。", toolResults, stoppedReason, ...(invokedSkills.length ? { invokedSkills } : {}) };
+  return {
+    finalText: finalText || "工程任务已完成，但没有可显示的回复。",
+    toolResults,
+    stoppedReason,
+    ...(invokedSkills.length ? { invokedSkills } : {}),
+    ...(activeCommands.length ? { activeCommands } : {}),
+    ...(activeOutputStyles.length ? { activeOutputStyles } : {}),
+    ...(activeMemories.length ? { activeMemories } : {}),
+    ...(settingsDeniedToolRules.length || settingsAskToolRules.length || settingsAllowedToolRules.length || settingsDefaultMode?.mode ? {
+      settingsPermissions: {
+        denyCount: settingsDeniedToolRules.length,
+        askCount: settingsAskToolRules.length,
+        allowCount: settingsAllowedToolRules.length,
+        defaultMode: settingsDefaultMode?.mode || "default",
+        defaultModePath: settingsDefaultMode?.path || "",
+        deniedTools: [...new Set(settingsDeniedToolRules.map((rule) => rule.toolName))],
+        askedTools: [...new Set(settingsAskToolRules.map((rule) => rule.toolName))],
+        allowedTools: [...new Set(settingsAllowedToolRules.map((rule) => rule.toolName))],
+        toolWideDenied: settingsToolWideDeniedNames,
+        toolWideAsk: settingsToolWideAskNames,
+        toolWideAllow: settingsToolWideAllowNames,
+      },
+    } : {}),
+  };
 }
 
 function summarizeToolCall(call) {

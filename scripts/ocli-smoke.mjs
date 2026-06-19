@@ -231,6 +231,23 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("custom agent command preload smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
+      const agentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (!agentTool || agentTool.function?.parameters?.properties?.agentName?.type !== "string") {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "top-level ocli agent request did not include agentName schema for command preload agent" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_commanded_custom_agent","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"commanded\\",\\"description\\":\\"commanded-check\\",\\"task\\":\\"Use the preloaded review-flow command and report the command context marker.\\",\\"maxTurns\\":4}"}}]}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("custom agent initial prompt smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
       const agentTool = Array.isArray(body.tools)
         ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
@@ -496,6 +513,28 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("子代理任务：Use the preloaded review-flow command")) {
+      const nestedCommandReadTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "command_read")
+        : undefined;
+      if (nestedCommandReadTool && !text.includes("<command_context")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "commanded custom agent should receive preloaded command context before needing command_read" } }));
+        return;
+      }
+      if (!text.includes("<command_context") || !text.includes("Review Flow") || !text.includes("command context marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "custom agent command context was not preloaded into sub-agent request" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"custom agent command preload marker observed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("子代理任务：Run starter custom agent initial prompt check.")) {
       if (!text.includes("initial prompt marker")) {
         response.writeHead(400, { "Content-Type": "application/json" });
@@ -564,6 +603,15 @@ const fakeApiServer = createServer(async (request, response) => {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"custom agent skill preload smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("ocli 子代理已完成 commanded-check") && text.includes("custom agent command preload marker observed")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"custom agent command preload smoke completed"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -668,7 +716,7 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
-    if (text.includes("ocli 已运行 find")) {
+    if (text.includes("readonly command smoke") && text.includes("ocli 已运行 find")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"readonly command smoke completed"}}]}',
@@ -727,6 +775,249 @@ const fakeApiServer = createServer(async (request, response) => {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"skill guided smoke completed\\n\\n生成文件：research/skill-guided-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("command guided smoke") && !text.includes("ocli 已列出工作区命令")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"command_list\\",\\"arguments\\":{\\"maxResults\\":10}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("command guided smoke") && text.includes("ocli 已列出工作区命令") && !text.includes("ocli 已读取工作区命令")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"command_read\\",\\"arguments\\":{\\"name\\":\\"review-flow\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("command guided smoke") && text.includes("<command_context") && text.includes("command context marker") && !text.includes("command-guided-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"commands/command-guided-output.txt\\",\\"content\\":\\"command guided smoke used command context marker\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("command-guided-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"command guided smoke completed\\n\\n生成文件：commands/command-guided-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("preloaded command smoke") && text.includes("<command_context") && text.includes("preloaded command marker") && !text.includes("preloaded-command-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"commands/preloaded-command-output.txt\\",\\"content\\":\\"preloaded command smoke used command context marker\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("preloaded-command-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"preloaded command smoke completed\\n\\n生成文件：commands/preloaded-command-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("output style guided smoke") && !text.includes("ocli 已列出输出风格")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"output_style_list\\",\\"arguments\\":{\\"maxResults\\":10}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("output style guided smoke") && text.includes("ocli 已列出输出风格") && !text.includes("ocli 已读取输出风格")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"output_style_read\\",\\"arguments\\":{\\"name\\":\\"concise-local\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("output style guided smoke") && text.includes("<output_style_context") && text.includes("Keep output short.") && !text.includes("style-guided-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"styles/style-guided-output.txt\\",\\"content\\":\\"output style guided smoke used concise style\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("style-guided-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"output style guided smoke completed\\n\\n生成文件：styles/style-guided-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings output style smoke") && text.includes("<output_style_context") && text.includes("Keep output short.") && !text.includes("settings-style-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"styles/settings-style-output.txt\\",\\"content\\":\\"settings output style smoke used settings concise style\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings-style-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings output style smoke completed\\n\\n生成文件：styles/settings-style-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("memory guided smoke") && !text.includes("ocli 已读取项目记忆")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"memory_read\\",\\"arguments\\":{\\"name\\":\\"testing-policy\\",\\"scope\\":\\"project\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("memory guided smoke") && text.includes("<memory_context") && text.includes("ocli smoke tests") && !text.includes("memory-guided-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"memory/memory-guided-output.txt\\",\\"content\\":\\"memory guided smoke used testing policy memory\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("memory-guided-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"memory guided smoke completed\\n\\n生成文件：memory/memory-guided-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("preloaded memory smoke") && text.includes("<memory_context") && text.includes("preloaded memory marker") && !text.includes("preloaded-memory-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"memory/preloaded-memory-output.txt\\",\\"content\\":\\"preloaded memory smoke used memory context marker\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("preloaded-memory-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"preloaded memory smoke completed\\n\\n生成文件：memory/preloaded-memory-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings permissions deny smoke") && !text.includes("denied-by-settings.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"denied-by-settings.txt\\",\\"content\\":\\"this should not be written\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings permissions deny smoke") && text.includes("denied by .oases/settings.json permissions.deny")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings permissions deny smoke completed\\n\\nocli correctly blocked denied-by-settings.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings permissions ask smoke") && !text.includes("ask-by-settings.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"ask-by-settings.txt\\",\\"content\\":\\"approved settings ask write\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings permissions ask smoke") && text.includes("ocli 已写入 ask-by-settings.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings permissions ask smoke completed\\n\\nocli approved ask-by-settings.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings permissions allow smoke") && !text.includes("ocli 已运行 find")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_command\\",\\"arguments\\":{\\"command\\":\\"find . -maxdepth 1 -type f\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings permissions allow smoke") && text.includes("ocli 已运行 find")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings permissions allow smoke completed\\n\\nocli allowed configured read-only command"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings defaultMode plan smoke") && !text.includes("plan-mode-blocked.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"plan-mode-blocked.txt\\",\\"content\\":\\"this should not be written in plan mode\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings defaultMode plan smoke") && text.includes("defaultMode=plan")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings defaultMode plan smoke completed\\n\\nocli blocked write_file in plan mode"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings defaultMode dontAsk smoke") && !text.includes("defaultMode=dontAsk")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"run_command\\",\\"arguments\\":{\\"command\\":\\"find . -maxdepth 1 -type f\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings defaultMode dontAsk smoke") && text.includes("defaultMode=dontAsk")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings defaultMode dontAsk smoke completed\\n\\nocli denied approval-required command without prompting"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -859,7 +1150,7 @@ const fakeApiServer = createServer(async (request, response) => {
 await new Promise((resolve) => fakeApiServer.listen(fakeApiPort, "127.0.0.1", resolve));
 
 function startOcliServer() {
-  return spawn(process.execPath, ["bin/ocli.js", "serve", "--workspace", workspace, "--port", String(port), "--token", smokeToken], {
+  return spawn(process.execPath, ["index.js", "serve", "--workspace", workspace, "--port", String(port), "--token", smokeToken], {
     cwd: path.resolve(import.meta.dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
@@ -890,7 +1181,7 @@ try {
   const runtimeInfo = JSON.parse(await readTextEventually(path.join(workspace, ".oases", "ocli", "runtime.json")));
   assert(runtimeInfo.token === smokeToken && runtimeInfo.port === port, "ocli should persist current runtime token and port for ocli open");
   assert(String(runtimeInfo.webUrl || "").includes(`ocliToken=${smokeToken}`), "runtime info should include tokenized web URL");
-  const openDryRun = await runLocal(process.execPath, ["bin/ocli.js", "open", "--workspace", workspace, "--dry-run"], path.resolve(import.meta.dirname, ".."));
+  const openDryRun = await runLocal(process.execPath, ["index.js", "open", "--workspace", workspace, "--dry-run"], path.resolve(import.meta.dirname, ".."));
   assert(openDryRun.stdout.includes(`ocliToken=${smokeToken}`), "ocli open --dry-run should print the tokenized web URL");
 
   const tools = await request("/tools");
@@ -903,6 +1194,11 @@ try {
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "worktree_apply" && tool.risk === "destructive"), "/tools should expose worktree_apply metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "worktree_remove" && tool.risk === "destructive"), "/tools should expose worktree_remove metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "todo_write" && tool.risk === "write"), "/tools should expose todo_write metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "settings_list" && tool.risk === "read"), "/tools should expose settings_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "settings_read" && tool.risk === "read"), "/tools should expose settings_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_list" && tool.risk === "read"), "/tools should expose memory_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_read" && tool.risk === "read"), "/tools should expose memory_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_write" && tool.risk === "write"), "/tools should expose memory_write metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_list" && tool.risk === "read"), "/tools should expose skill_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_read" && tool.risk === "read"), "/tools should expose skill_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_asset_list" && tool.risk === "read"), "/tools should expose skill_asset_list metadata");
@@ -910,6 +1206,8 @@ try {
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_install" && tool.risk === "write"), "/tools should expose skill_install metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "command_list" && tool.risk === "read"), "/tools should expose command_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "command_read" && tool.risk === "read"), "/tools should expose command_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "output_style_list" && tool.risk === "read"), "/tools should expose output_style_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "output_style_read" && tool.risk === "read"), "/tools should expose output_style_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_list" && tool.risk === "read"), "/tools should expose plugin_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_read" && tool.risk === "read"), "/tools should expose plugin_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_capability_list" && tool.risk === "read"), "/tools should expose plugin_capability_list metadata");
@@ -917,6 +1215,9 @@ try {
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_command_list" && tool.risk === "read"), "/tools should expose plugin_command_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_command_read" && tool.risk === "read"), "/tools should expose plugin_command_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_command_install" && tool.risk === "write"), "/tools should expose plugin_command_install metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_output_style_list" && tool.risk === "read"), "/tools should expose plugin_output_style_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_output_style_read" && tool.risk === "read"), "/tools should expose plugin_output_style_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_output_style_install" && tool.risk === "write"), "/tools should expose plugin_output_style_install metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_hook_list" && tool.risk === "read"), "/tools should expose plugin_hook_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_hook_read" && tool.risk === "read"), "/tools should expose plugin_hook_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_agent_list" && tool.risk === "read"), "/tools should expose plugin_agent_list metadata");
@@ -950,6 +1251,91 @@ try {
     body: JSON.stringify({}),
   });
   assert(directAgentStatus.response.status >= 400, "direct agent_status endpoint calls should be rejected outside agent sessions");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.json", content: JSON.stringify({ outputStyle: "concise-local", env: { OASES_API_KEY: "workspace-secret" }, permissions: { allow: ["read_file"], deny: ["Write(denied-by-settings.txt)"], ask: ["Write(ask-by-settings.txt)"] } }, null, 2) }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".claude/settings.json", content: JSON.stringify({ model: "claude-compatible", authToken: "claude-secret" }, null, 2) }),
+  });
+  const settingsList = await request("/tools/settings_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert(settingsList.payload?.data?.settingsFiles?.some((file) => file?.path === ".oases/settings.json"), "settings_list should list Oases workspace settings");
+  assert(!settingsList.payload?.data?.settingsFiles?.some((file) => String(file?.path || "").startsWith(".claude/")), "settings_list should hide Claude settings by default");
+  const settingsRead = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.json" }),
+  });
+  assert(settingsRead.payload?.data?.settings?.keys?.includes("outputStyle"), "settings_read should summarize workspace settings keys");
+  assert(settingsRead.payload?.data?.settings?.values?.env?.values?.OASES_API_KEY?.redacted === true, "settings_read should redact sensitive nested keys");
+  assert(!JSON.stringify(settingsRead.payload?.data || {}).includes("workspace-secret"), "settings_read should not expose sensitive workspace setting values");
+  const claudeSettingsReadBlocked = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".claude/settings.json" }),
+  });
+  assert(claudeSettingsReadBlocked.response.status >= 400, "settings_read should require includeClaude for .claude settings");
+  const claudeSettingsRead = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".claude/settings.json", includeClaude: true }),
+  });
+  assert(claudeSettingsRead.payload?.data?.settings?.values?.authToken?.redacted === true, "settings_read includeClaude should redact sensitive Claude settings");
+  assert(!JSON.stringify(claudeSettingsRead.payload?.data || {}).includes("claude-secret"), "settings_read should not expose sensitive Claude setting values");
+
+  const memoryWrite = await request("/tools/memory_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      scope: "project",
+      name: "testing-policy",
+      title: "Testing policy",
+      description: "How this workspace validates changes",
+      tags: ["testing", "policy"],
+      content: "Integration-level changes should run the ocli smoke tests before release.",
+    }),
+  });
+  assert(memoryWrite.payload?.ok === true, "memory_write should create project memory");
+  assert(memoryWrite.payload?.data?.path === ".oases/memory/project/testing-policy.md", "memory_write should write under the scoped memory directory");
+  assert(memoryWrite.payload?.data?.artifacts?.[0]?.role === "memory_file", "memory_write should return a memory artifact");
+  const memoryList = await request("/tools/memory_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "project" }),
+  });
+  assert(memoryList.payload?.data?.memories?.some((memory) => memory?.name === "testing-policy" && memory?.scope === "project" && memory?.tags?.includes("testing")), "memory_list should list scoped project memories with metadata");
+  const memoryRead = await request("/tools/memory_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "testing-policy", scope: "project" }),
+  });
+  assert(memoryRead.payload?.data?.body?.includes("ocli smoke tests"), "memory_read should read memory body text");
+  const duplicateMemoryWrite = await request("/tools/memory_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "project", name: "testing-policy", title: "Testing policy", content: "duplicate" }),
+  });
+  assert(duplicateMemoryWrite.response.status >= 400, "memory_write should refuse to overwrite by default");
+  const blockedMemoryRead = await request("/tools/memory_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.json" }),
+  });
+  assert(blockedMemoryRead.response.status >= 400, "memory_read should reject paths outside .oases/memory");
+  const nestedMemoryWrite = await request("/tools/memory_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "project", path: ".oases/memory/project/nested/testing.md", title: "Nested testing", content: "nested memory" }),
+  });
+  assert(nestedMemoryWrite.response.status >= 400, "memory_write should reject nested memory paths");
 
   const write = await request("/tools/write_file", {
     method: "POST",
@@ -994,6 +1380,11 @@ try {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: ".oases/skills/research/SKILL.md", content: "---\nname: research\ndescription: Research workflow skill\n---\n\n# Research Skill\n\nUse fetch_url and write_file for sourced outputs.\n\nskill preload marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/commands/review-flow.md", content: "---\nname: review-flow\ndescription: Review workflow command\n---\n\n# Review Flow\n\nUse a concise plan, inspect relevant files, and write the result.\n\ncommand context marker\n" }),
   });
   const skillList = await request("/tools/skill_list", {
     method: "POST",
@@ -1140,7 +1531,7 @@ try {
   await request("/tools/write_file", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: ".oases/plugins/feature-dev/output-styles/concise.md", content: "# Concise\n\nKeep output short.\n" }),
+    body: JSON.stringify({ path: ".oases/plugins/feature-dev/output-styles/concise.md", content: "---\ndescription: Concise engineering summaries\n---\n\n# Concise\n\nKeep output short.\n" }),
   });
   await request("/tools/write_file", {
     method: "POST",
@@ -1189,6 +1580,47 @@ try {
   assert(pluginCapabilityRead.payload?.data?.manifest?.settings?.values?.env?.values?.OASES_API_KEY?.redacted === true, "plugin_capability_read should redact sensitive manifest settings");
   assert(pluginCapabilityRead.payload?.data?.settingsFile?.settings?.values?.apiToken?.redacted === true, "plugin_capability_read should redact sensitive settings.json keys");
   assert(!JSON.stringify(pluginCapabilityRead.payload?.data || {}).includes("should-not-leak"), "plugin_capability_read should not expose sensitive setting values");
+  const pluginOutputStyleList = await request("/tools/plugin_output_style_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", maxResults: 10 }),
+  });
+  const listedPluginOutputStyle = pluginOutputStyleList.payload?.data?.outputStyles?.find((style) => style?.name === "concise");
+  assert(listedPluginOutputStyle?.path === ".oases/plugins/feature-dev/output-styles/concise.md", "plugin_output_style_list should list plugin output style files");
+  assert(listedPluginOutputStyle?.title === "Concise", "plugin_output_style_list should parse output style heading");
+  assert(listedPluginOutputStyle?.description === "Concise engineering summaries", "plugin_output_style_list should parse output style frontmatter");
+  const pluginOutputStyleRead = await request("/tools/plugin_output_style_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "concise", maxChars: 4000 }),
+  });
+  assert(pluginOutputStyleRead.payload?.data?.body?.includes("Keep output short."), "plugin_output_style_read should read plugin output style bodies");
+  assert(pluginOutputStyleRead.payload?.data?.outputStyle?.source === "plugin", "plugin_output_style_read should label plugin output style source");
+  const pluginOutputStyleInstall = await request("/tools/plugin_output_style_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "concise", targetName: "concise-local" }),
+  });
+  assert(pluginOutputStyleInstall.payload?.data?.installed === true, "plugin_output_style_install should install plugin output styles into .oases/output-styles");
+  assert(pluginOutputStyleInstall.payload?.data?.path === ".oases/output-styles/concise-local.md", "plugin_output_style_install should report installed workspace output style path");
+  const outputStyleList = await request("/tools/output_style_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 20 }),
+  });
+  assert(outputStyleList.payload?.data?.outputStyles?.some((style) => style?.path === ".oases/output-styles/concise-local.md"), "output_style_list should include installed plugin output styles");
+  const outputStyleRead = await request("/tools/output_style_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "concise-local", maxChars: 4000 }),
+  });
+  assert(outputStyleRead.payload?.data?.body?.includes("Keep output short."), "output_style_read should read installed output style bodies");
+  const duplicatePluginOutputStyleInstall = await request("/tools/plugin_output_style_install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "concise", targetName: "concise-local" }),
+  });
+  assert(duplicatePluginOutputStyleInstall.response.status >= 400, "plugin_output_style_install should refuse to overwrite existing workspace output styles");
   const pluginHookList = await request("/tools/plugin_hook_list", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1439,6 +1871,30 @@ try {
     body: JSON.stringify({ includeDisabled: true, maxResults: 50 }),
   });
   assert(disabledIncludedCommands.payload?.data?.commands?.some((command) => command?.plugin === "feature-dev"), "plugin_command_list includeDisabled should include disabled plugins");
+  const disabledDefaultOutputStyles = await request("/tools/plugin_output_style_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 50 }),
+  });
+  assert(!disabledDefaultOutputStyles.payload?.data?.outputStyles?.some((style) => style?.plugin === "feature-dev"), "plugin_output_style_list should hide disabled plugins by default");
+  const disabledIncludedOutputStyles = await request("/tools/plugin_output_style_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ includeDisabled: true, maxResults: 50 }),
+  });
+  assert(disabledIncludedOutputStyles.payload?.data?.outputStyles?.some((style) => style?.plugin === "feature-dev"), "plugin_output_style_list includeDisabled should include disabled plugins");
+  const disabledDefaultOutputStyleRead = await request("/tools/plugin_output_style_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "concise" }),
+  });
+  assert(disabledDefaultOutputStyleRead.response.status >= 400, "plugin_output_style_read should hide disabled plugins by default");
+  const disabledIncludedOutputStyleRead = await request("/tools/plugin_output_style_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plugin: "feature-dev", name: "concise", includeDisabled: true }),
+  });
+  assert(disabledIncludedOutputStyleRead.payload?.data?.outputStyle?.plugin === "feature-dev", "plugin_output_style_read includeDisabled should read disabled plugin styles");
   const disabledDefaultHooks = await request("/tools/plugin_hook_list", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1584,6 +2040,11 @@ try {
   await request("/tools/write_file", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/agents/commanded.md", content: "---\nname: commanded\ndescription: commanded-check\nagentType: verify\ncommands: review-flow\nmemories: project:testing-policy\n---\n\n# Commanded Agent\n\nUse preloaded command templates before answering.\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: ".oases/agents/starter.md", content: "---\nname: starter\ndescription: starter-check\nagentType: general\ninitialPrompt: initial prompt marker\n---\n\n# Starter Agent\n\nUse the initial prompt before handling the assigned task.\n" }),
   });
   await request("/tools/write_file", {
@@ -1604,6 +2065,7 @@ try {
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "reviewer" && agent?.path === ".oases/agents/reviewer.md"), "agent_list should discover workspace-local agents");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "reader" && agent?.tools?.includes("read_file")), "agent_list should expose custom agent tool metadata");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "skilled" && agent?.skills?.includes("research")), "agent_list should expose custom agent skill metadata");
+  assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "commanded" && agent?.commands?.includes("review-flow") && agent?.memories?.includes("project:testing-policy")), "agent_list should expose custom agent command and memory metadata");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "starter" && agent?.initialPrompt === "initial prompt marker"), "agent_list should expose custom agent initialPrompt metadata");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "yamlstarter" && agent?.tools?.includes("read_file") && agent?.disallowedTools?.includes("write_file") && agent?.skills?.includes("research") && String(agent?.initialPrompt || "").includes("second seeded line")), "agent_list should expose YAML list and block scalar custom agent metadata");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "effortful" && agent?.effort === "low"), "agent_list should expose custom agent effort metadata");
@@ -1614,6 +2076,13 @@ try {
   });
   assert(agentRead.payload?.data?.content?.includes("custom reviewer marker"), "agent_read should read agent content by name");
   assert(agentRead.payload?.data?.agent?.agentType === "verify", "agent_read should expose custom agent metadata");
+  const commandedAgentRead = await request("/tools/agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "commanded" }),
+  });
+  assert(commandedAgentRead.payload?.data?.agent?.commands?.includes("review-flow"), "agent_read should expose custom agent command metadata");
+  assert(commandedAgentRead.payload?.data?.agent?.memories?.includes("project:testing-policy"), "agent_read should expose custom agent memory metadata");
   const starterAgentRead = await request("/tools/agent_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1970,6 +2439,30 @@ try {
   assert(skillPreloadAgentResult?.data?.invokedSkills?.some((skill) => skill?.name === "research" && skill?.path === ".oases/skills/research/SKILL.md"), "custom agent should report preloaded skills as invoked skills");
   assert(skillPreloadAgentCompleted?.events?.some((event) => event?.type === "subagent_event" && event?.event?.type === "skill_loaded" && event?.event?.skill?.name === "research"), "custom agent skill preload should emit nested skill_loaded events");
 
+  const commandPreloadAgentStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli custom agent command preload smoke prompt",
+      messages: [{ role: "user", content: "custom agent command preload smoke" }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(commandPreloadAgentStarted.response.status === 202, "custom agent command preload smoke session should start");
+  const commandPreloadAgentCompleted = await waitForSessionDone(commandPreloadAgentStarted.payload?.data?.id);
+  assert(commandPreloadAgentCompleted?.data?.status === "completed", "custom agent command preload smoke session should complete");
+  assert(
+    commandPreloadAgentCompleted?.data?.result?.finalText?.includes("custom agent command preload smoke completed"),
+    `custom agent command preload smoke should reach final response: ${JSON.stringify(commandPreloadAgentCompleted?.data?.result || {}, null, 2)}`,
+  );
+  const commandPreloadAgentResult = commandPreloadAgentCompleted?.data?.result?.toolResults?.find((result) => result?.name === "agent_run" && result?.data?.agentName === "commanded");
+  assert(commandPreloadAgentResult?.data?.customAgent?.commands?.includes("review-flow"), "custom agent command preload result should expose declared command metadata");
+  assert(commandPreloadAgentResult?.data?.activeCommands?.some((command) => command?.name === "review-flow" && command?.path === ".oases/commands/review-flow.md"), "custom agent should report preloaded commands as active commands");
+  assert(commandPreloadAgentCompleted?.events?.some((event) => event?.type === "subagent_event" && event?.event?.type === "command_loaded" && event?.event?.command?.name === "review-flow"), "custom agent command preload should emit nested command_loaded events");
+
   const initialPromptAgentStarted = await request("/agent/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2276,6 +2769,290 @@ try {
   assert(skillGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "skill_list"), "skill guided smoke should list workspace skills");
   assert(skillGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "skill_read"), "skill guided smoke should read the matching skill");
   assert((await readTextEventually(path.join(workspace, "research", "skill-guided-output.txt"))).includes("used research skill"), "skill guided smoke should write output after skill context is loaded");
+
+  const commandGuidedStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli command guided smoke prompt",
+      messages: [{ role: "user", content: "command guided smoke" }],
+      maxTurns: 8,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(commandGuidedStarted.response.status === 202, "command guided smoke session should start");
+  const commandGuidedCompleted = await waitForSessionDone(commandGuidedStarted.payload?.data?.id);
+  assert(commandGuidedCompleted?.data?.status === "completed", "command guided smoke session should complete");
+  assert(commandGuidedCompleted?.data?.result?.finalText?.includes("command guided smoke completed"), "command guided smoke should reach final response");
+  assert(commandGuidedCompleted?.events?.some((event) => event?.type === "command_loaded" && event?.command?.name === "review-flow"), "command guided smoke should emit a command_loaded event");
+  assert(commandGuidedCompleted?.data?.result?.activeCommands?.some((command) => command?.name === "review-flow"), "command guided smoke should record active commands in the result");
+  assert(commandGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "command_list"), "command guided smoke should list workspace commands");
+  assert(commandGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "command_read"), "command guided smoke should read the matching command");
+  assert((await readTextEventually(path.join(workspace, "commands", "command-guided-output.txt"))).includes("used command context marker"), "command guided smoke should write output after command context is loaded");
+
+  const preloadedCommandStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli preloaded command smoke prompt",
+      messages: [{ role: "user", content: "preloaded command smoke" }],
+      preloadedCommands: [{
+        name: "preloaded-review",
+        title: "Preloaded Review",
+        path: ".oases/commands/preloaded-review.md",
+        source: "workspace",
+        content: "# Preloaded Review\n\npreloaded command marker\n",
+      }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(preloadedCommandStarted.response.status === 202, "preloaded command smoke session should start");
+  const preloadedCommandCompleted = await waitForSessionDone(preloadedCommandStarted.payload?.data?.id);
+  assert(preloadedCommandCompleted?.data?.status === "completed", "preloaded command smoke session should complete");
+  assert(preloadedCommandCompleted?.data?.result?.finalText?.includes("preloaded command smoke completed"), "preloaded command smoke should reach final response");
+  assert(preloadedCommandCompleted?.events?.some((event) => event?.type === "command_loaded" && event?.preloaded === true && event?.command?.name === "preloaded-review"), "preloaded command smoke should emit a preloaded command_loaded event");
+  assert(preloadedCommandCompleted?.data?.result?.activeCommands?.some((command) => command?.name === "preloaded-review"), "preloaded command smoke should record active commands in the result");
+  assert(!preloadedCommandCompleted?.data?.result?.toolResults?.some((result) => result?.name === "command_read"), "preloaded command smoke should not require a command_read tool call");
+  assert((await readTextEventually(path.join(workspace, "commands", "preloaded-command-output.txt"))).includes("used command context marker"), "preloaded command smoke should write output after preloaded command context is injected");
+
+  const outputStyleGuidedStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli output style guided smoke prompt",
+      messages: [{ role: "user", content: "output style guided smoke" }],
+      maxTurns: 8,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(outputStyleGuidedStarted.response.status === 202, "output style guided smoke session should start");
+  const outputStyleGuidedCompleted = await waitForSessionDone(outputStyleGuidedStarted.payload?.data?.id);
+  assert(outputStyleGuidedCompleted?.data?.status === "completed", "output style guided smoke session should complete");
+  assert(outputStyleGuidedCompleted?.data?.result?.finalText?.includes("output style guided smoke completed"), "output style guided smoke should reach final response");
+  assert(outputStyleGuidedCompleted?.events?.some((event) => event?.type === "output_style_loaded" && event?.outputStyle?.name === "concise-local"), "output style guided smoke should emit an output_style_loaded event");
+  assert(outputStyleGuidedCompleted?.data?.result?.activeOutputStyles?.some((style) => style?.name === "concise-local"), "output style guided smoke should record active output styles in the result");
+  assert(outputStyleGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "output_style_list"), "output style guided smoke should list workspace output styles");
+  assert(outputStyleGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "output_style_read"), "output style guided smoke should read the matching output style");
+  assert((await readTextEventually(path.join(workspace, "styles", "style-guided-output.txt"))).includes("used concise style"), "output style guided smoke should write output after output style context is loaded");
+
+  const settingsOutputStyleStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings output style smoke prompt",
+      messages: [{ role: "user", content: "settings output style smoke" }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(settingsOutputStyleStarted.response.status === 202, "settings output style smoke session should start");
+  const settingsOutputStyleCompleted = await waitForSessionDone(settingsOutputStyleStarted.payload?.data?.id);
+  assert(settingsOutputStyleCompleted?.data?.status === "completed", "settings output style smoke session should complete");
+  assert(settingsOutputStyleCompleted?.data?.result?.finalText?.includes("settings output style smoke completed"), "settings output style smoke should reach final response");
+  assert(settingsOutputStyleCompleted?.events?.some((event) => event?.type === "output_style_loaded" && event?.settings === true && event?.outputStyle?.settingPath === ".oases/settings.json"), "settings output style smoke should load outputStyle from workspace settings");
+  assert(settingsOutputStyleCompleted?.data?.result?.activeOutputStyles?.some((style) => style?.name === "concise-local" && style?.settingPath === ".oases/settings.json"), "settings output style smoke should record settings-loaded output style metadata");
+  assert(!settingsOutputStyleCompleted?.data?.result?.toolResults?.some((result) => result?.name === "output_style_read"), "settings output style smoke should not require the model to call output_style_read");
+  assert((await readTextEventually(path.join(workspace, "styles", "settings-style-output.txt"))).includes("used settings concise style"), "settings output style smoke should write output after settings output style context is loaded");
+
+  const memoryGuidedStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli memory guided smoke prompt",
+      messages: [{ role: "user", content: "memory guided smoke" }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(memoryGuidedStarted.response.status === 202, "memory guided smoke session should start");
+  const memoryGuidedCompleted = await waitForSessionDone(memoryGuidedStarted.payload?.data?.id);
+  assert(memoryGuidedCompleted?.data?.status === "completed", "memory guided smoke session should complete");
+  assert(memoryGuidedCompleted?.data?.result?.finalText?.includes("memory guided smoke completed"), "memory guided smoke should reach final response");
+  assert(memoryGuidedCompleted?.events?.some((event) => event?.type === "memory_loaded" && event?.memory?.name === "testing-policy"), "memory guided smoke should emit a memory_loaded event");
+  assert(memoryGuidedCompleted?.data?.result?.activeMemories?.some((memory) => memory?.name === "testing-policy" && memory?.scope === "project"), "memory guided smoke should record active memories in the result");
+  assert(memoryGuidedCompleted?.data?.result?.toolResults?.some((result) => result?.name === "memory_read"), "memory guided smoke should read the matching memory");
+  assert((await readTextEventually(path.join(workspace, "memory", "memory-guided-output.txt"))).includes("testing policy memory"), "memory guided smoke should write output after memory context is loaded");
+
+  const preloadedMemoryStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli preloaded memory smoke prompt",
+      messages: [{ role: "user", content: "preloaded memory smoke" }],
+      preloadedMemories: [{
+        name: "preloaded-policy",
+        title: "Preloaded Policy",
+        scope: "team",
+        path: ".oases/memory/team/preloaded-policy.md",
+        body: "# Preloaded Policy\n\npreloaded memory marker\n",
+        tags: ["preloaded"],
+      }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(preloadedMemoryStarted.response.status === 202, "preloaded memory smoke session should start");
+  const preloadedMemoryCompleted = await waitForSessionDone(preloadedMemoryStarted.payload?.data?.id);
+  assert(preloadedMemoryCompleted?.data?.status === "completed", "preloaded memory smoke session should complete");
+  assert(preloadedMemoryCompleted?.data?.result?.finalText?.includes("preloaded memory smoke completed"), "preloaded memory smoke should reach final response");
+  assert(preloadedMemoryCompleted?.events?.some((event) => event?.type === "memory_loaded" && event?.preloaded === true && event?.memory?.name === "preloaded-policy"), "preloaded memory smoke should emit a preloaded memory_loaded event");
+  assert(preloadedMemoryCompleted?.data?.result?.activeMemories?.some((memory) => memory?.name === "preloaded-policy" && memory?.scope === "team"), "preloaded memory smoke should record active memories in the result");
+  assert(!preloadedMemoryCompleted?.data?.result?.toolResults?.some((result) => result?.name === "memory_read"), "preloaded memory smoke should not require a memory_read tool call");
+  assert((await readTextEventually(path.join(workspace, "memory", "preloaded-memory-output.txt"))).includes("memory context marker"), "preloaded memory smoke should write output after preloaded memory context is injected");
+
+  const settingsPermissionsStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings permissions deny smoke prompt",
+      messages: [{ role: "user", content: "settings permissions deny smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(settingsPermissionsStarted.response.status === 202, "settings permissions deny smoke session should start");
+  const settingsPermissionsCompleted = await waitForSessionDone(settingsPermissionsStarted.payload?.data?.id);
+  assert(settingsPermissionsCompleted?.data?.status === "completed", "settings permissions deny smoke session should complete");
+  assert(settingsPermissionsCompleted?.data?.result?.finalText?.includes("settings permissions deny smoke completed"), "settings permissions deny smoke should reach final response after denial");
+  assert(settingsPermissionsCompleted?.events?.some((event) => event?.type === "settings_permissions_loaded" && event?.permissions?.denyCount >= 1), "settings permissions deny smoke should emit settings_permissions_loaded");
+  const deniedWriteResult = settingsPermissionsCompleted?.data?.result?.toolResults?.find((result) => result?.name === "write_file" && result?.ok === false);
+  assert(String(deniedWriteResult?.message || "").includes("permissions.deny"), "settings permissions deny smoke should block matching write_file calls");
+  assert(settingsPermissionsCompleted?.data?.result?.settingsPermissions?.deniedTools?.includes("write_file"), "settings permissions deny smoke should record settings permission metadata");
+  const deniedFileContent = await readFile(path.join(workspace, "denied-by-settings.txt"), "utf8").catch(() => "");
+  assert(deniedFileContent === "", "settings permissions deny smoke should not write denied files");
+
+  const settingsAskStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings permissions ask smoke prompt",
+      messages: [{ role: "user", content: "settings permissions ask smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(settingsAskStarted.response.status === 202, "settings permissions ask smoke session should start");
+  const settingsAskSessionId = settingsAskStarted.payload?.data?.id;
+  const settingsAskApprovalEvent = await waitForApproval(settingsAskSessionId);
+  assert(settingsAskApprovalEvent.tool === "write_file", "settings permissions ask smoke should request approval for write_file");
+  assert(settingsAskApprovalEvent.category === "settings_permission_ask", "settings permissions ask smoke should use the settings approval category");
+  assert(String(settingsAskApprovalEvent.reason || "").includes("permissions.ask"), "settings permissions ask approval should explain the settings rule");
+  const settingsAskApproved = await request(`/agent/sessions/${encodeURIComponent(settingsAskSessionId)}/approvals/${encodeURIComponent(settingsAskApprovalEvent.approvalId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision: "approve" }),
+  });
+  assert(settingsAskApproved.payload?.data?.approved === true, "settings permissions ask approval endpoint should approve the pending tool");
+  const settingsAskCompleted = await waitForSessionDone(settingsAskSessionId);
+  assert(settingsAskCompleted?.data?.status === "completed", "settings permissions ask smoke session should complete after approval");
+  assert(settingsAskCompleted?.data?.result?.finalText?.includes("settings permissions ask smoke completed"), "settings permissions ask smoke should reach final response after approval");
+  assert(settingsAskCompleted?.events?.some((event) => event?.type === "settings_permissions_loaded" && event?.permissions?.askCount >= 1), "settings permissions ask smoke should emit settings_permissions_loaded with ask metadata");
+  assert(settingsAskCompleted?.data?.result?.settingsPermissions?.askedTools?.includes("write_file"), "settings permissions ask smoke should record ask permission metadata");
+  assert((await readTextEventually(path.join(workspace, "ask-by-settings.txt"))).includes("approved settings ask write"), "settings permissions ask smoke should write the approved file");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: { allow: ["Bash(find . -maxdepth 1 -type f)"] } }, null, 2) }),
+  });
+  const settingsAllowStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings permissions allow smoke prompt",
+      messages: [{ role: "user", content: "settings permissions allow smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(settingsAllowStarted.response.status === 202, "settings permissions allow smoke session should start");
+  const settingsAllowCompleted = await waitForSessionDone(settingsAllowStarted.payload?.data?.id);
+  assert(settingsAllowCompleted?.data?.status === "completed", "settings permissions allow smoke session should complete without approval");
+  assert(settingsAllowCompleted?.data?.result?.finalText?.includes("settings permissions allow smoke completed"), "settings permissions allow smoke should reach final response");
+  assert(!settingsAllowCompleted?.events?.some((event) => event?.type === "approval_required"), "settings permissions allow smoke should not request approval for the allowed command");
+  assert(settingsAllowCompleted?.events?.some((event) => event?.type === "settings_permission_allowed" && event?.tool === "run_command"), "settings permissions allow smoke should emit an allow audit event");
+  assert(settingsAllowCompleted?.events?.some((event) => event?.type === "settings_permissions_loaded" && event?.permissions?.allowCount >= 1), "settings permissions allow smoke should emit settings_permissions_loaded with allow metadata");
+  assert(settingsAllowCompleted?.data?.result?.settingsPermissions?.allowedTools?.includes("run_command"), "settings permissions allow smoke should record allow permission metadata");
+  assert(settingsAllowCompleted?.data?.result?.toolResults?.some((result) => result?.name === "run_command" && result?.ok === true), "settings permissions allow smoke should run the allowed command");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: { defaultMode: "plan" } }, null, 2) }),
+  });
+  const settingsPlanStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings defaultMode plan smoke prompt",
+      messages: [{ role: "user", content: "settings defaultMode plan smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(settingsPlanStarted.response.status === 202, "settings defaultMode plan smoke session should start");
+  const settingsPlanCompleted = await waitForSessionDone(settingsPlanStarted.payload?.data?.id);
+  assert(settingsPlanCompleted?.data?.status === "completed", "settings defaultMode plan smoke session should complete");
+  assert(settingsPlanCompleted?.data?.result?.finalText?.includes("settings defaultMode plan smoke completed"), "settings defaultMode plan smoke should reach final response after block");
+  assert(!settingsPlanCompleted?.events?.some((event) => event?.type === "approval_required"), "settings defaultMode plan smoke should not request approval");
+  const planWriteResult = settingsPlanCompleted?.data?.result?.toolResults?.find((result) => result?.name === "write_file" && result?.ok === false);
+  assert(String(planWriteResult?.message || "").includes("defaultMode=plan"), "settings defaultMode plan smoke should block write_file with a plan-mode error");
+  assert(settingsPlanCompleted?.data?.result?.settingsPermissions?.defaultMode === "plan", "settings defaultMode plan smoke should record plan mode metadata");
+  const planBlockedFileContent = await readFile(path.join(workspace, "plan-mode-blocked.txt"), "utf8").catch(() => "");
+  assert(planBlockedFileContent === "", "settings defaultMode plan smoke should not write blocked files");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: { defaultMode: "dontAsk" } }, null, 2) }),
+  });
+  const settingsDontAskStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings defaultMode dontAsk smoke prompt",
+      messages: [{ role: "user", content: "settings defaultMode dontAsk smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(settingsDontAskStarted.response.status === 202, "settings defaultMode dontAsk smoke session should start");
+  const settingsDontAskCompleted = await waitForSessionDone(settingsDontAskStarted.payload?.data?.id);
+  assert(settingsDontAskCompleted?.data?.status === "completed", "settings defaultMode dontAsk smoke session should complete");
+  assert(settingsDontAskCompleted?.data?.result?.finalText?.includes("settings defaultMode dontAsk smoke completed"), "settings defaultMode dontAsk smoke should reach final response after denial");
+  assert(!settingsDontAskCompleted?.events?.some((event) => event?.type === "approval_required"), "settings defaultMode dontAsk smoke should not request approval");
+  const dontAskCommandResult = settingsDontAskCompleted?.data?.result?.toolResults?.find((result) => result?.name === "run_command" && result?.ok === false);
+  assert(String(dontAskCommandResult?.message || "").includes("defaultMode=dontAsk"), "settings defaultMode dontAsk smoke should deny approval-required commands");
+  assert(settingsDontAskCompleted?.data?.result?.settingsPermissions?.defaultMode === "dontAsk", "settings defaultMode dontAsk smoke should record dontAsk mode metadata");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: {} }, null, 2) }),
+  });
 
   const crawlerArtifactStarted = await request("/agent/sessions", {
     method: "POST",

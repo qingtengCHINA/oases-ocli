@@ -55,7 +55,7 @@ assert(!supportsInteractiveUi(ttyStream, { OCLI_PLAIN_UI: "1" }, "darwin"), "pla
 assert(!supportsInteractiveUi({ isTTY: false }, { WT_SESSION: "1" }, "win32"), "non-TTY output should never animate");
 
 const help = await run(process.execPath, ["bin/ocli.js", "--help"]);
-assert(help.stdout.includes("ocli 0.1.7"), "packaged CLI should print help");
+assert(help.stdout.includes(`ocli ${manifest.version}`), "packaged CLI should print help");
 assert(help.stdout.includes("\n  ocli\n"), "packaged CLI help should include zero-argument startup");
 assert(help.stdout.includes("ocli --workspace ~/Projects/my-app"), "packaged CLI help should include short workspace example");
 assert(help.stdout.includes("ocli open"), "packaged CLI help should include open command");
@@ -106,11 +106,41 @@ try {
   await run("npm", ["init", "-y"], installRoot);
   await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], installRoot);
   const installedHelp = await run(process.platform === "win32" ? "node_modules\\.bin\\oases-ocli.cmd" : "node_modules/.bin/oases-ocli", ["--help"], installRoot);
-  assert(installedHelp.stdout.includes("ocli 0.1.7"), "installed tarball should expose the oases-ocli binary");
+  assert(installedHelp.stdout.includes(`ocli ${manifest.version}`), "installed tarball should expose the oases-ocli binary");
   assert(installedHelp.stdout.includes("\n  ocli\n"), "installed tarball help should include zero-argument startup");
   assert(installedHelp.stdout.includes("ocli open"), "installed tarball help should include open command");
   const installedUpdateDryRun = await run(process.platform === "win32" ? "node_modules\\.bin\\ocli.cmd" : "node_modules/.bin/ocli", ["upgrade", "--dry-run"], installRoot);
   assert(installedUpdateDryRun.stdout.includes("npm install -g oases-ocli@latest"), "installed tarball should expose update/upgrade dry-run");
+  await run(process.execPath, [
+    "--input-type=module",
+    "-e",
+    `
+import { handleTool } from './node_modules/oases-ocli/src/tools.js';
+const written = await handleTool(process.cwd(), 'memory_write', {
+  scope: 'team',
+  name: 'release-policy',
+  title: 'Release policy',
+  description: 'How this team validates package releases',
+  tags: ['release', 'memory'],
+  content: 'Run package smoke before publishing oases-ocli.',
+});
+if (!written.written || written.path !== '.oases/memory/team/release-policy.md') throw new Error('installed package could not write scoped memory');
+if (written.artifacts?.[0]?.role !== 'memory_file') throw new Error('installed package memory_write did not return memory artifact');
+const listed = await handleTool(process.cwd(), 'memory_list', { scope: 'team' });
+if (!listed.memories?.some((memory) => memory.name === 'release-policy' && memory.scope === 'team' && memory.tags?.includes('release'))) throw new Error('installed package could not list scoped memory metadata');
+const read = await handleTool(process.cwd(), 'memory_read', { name: 'release-policy', scope: 'team' });
+if (!String(read.body || '').includes('package smoke')) throw new Error('installed package could not read memory body');
+let duplicateRejected = false;
+try { await handleTool(process.cwd(), 'memory_write', { scope: 'team', name: 'release-policy', title: 'Release policy', content: 'duplicate' }); } catch { duplicateRejected = true; }
+if (!duplicateRejected) throw new Error('installed package memory_write should reject overwrite by default');
+let outsideRejected = false;
+try { await handleTool(process.cwd(), 'memory_read', { path: '.oases/settings.json' }); } catch { outsideRejected = true; }
+if (!outsideRejected) throw new Error('installed package memory_read should reject paths outside .oases/memory');
+let nestedRejected = false;
+try { await handleTool(process.cwd(), 'memory_write', { scope: 'team', path: '.oases/memory/team/nested/release.md', title: 'Nested', content: 'nested' }); } catch { nestedRejected = true; }
+if (!nestedRejected) throw new Error('installed package memory_write should reject nested memory paths');
+`,
+  ], installRoot);
   await run(process.execPath, [
     "--input-type=module",
     "-e",
@@ -140,7 +170,7 @@ await writeFile('.oases/plugins/capability/.claude-plugin/plugin.json', JSON.str
   outputStylesPaths: ['./output-styles'],
   commandsMetadata: { capability: { description: 'Capability command', allowedTools: ['read_file'] } },
 }, null, 2));
-await writeFile('.oases/plugins/capability/output-styles/concise.md', '# Concise\\n');
+await writeFile('.oases/plugins/capability/output-styles/concise.md', '---\\ndescription: Concise package output\\n---\\n\\n# Concise\\n\\nKeep package output short.\\n');
 await writeFile('.oases/plugins/capability/settings.json', JSON.stringify({ safeMode: true, apiToken: 'should-not-leak' }, null, 2));
 const listed = await handleTool(process.cwd(), 'plugin_capability_list', { plugin: 'capability-plugin' });
 const capability = listed.capabilities?.find((item) => item.plugin === 'capability-plugin');
@@ -151,14 +181,32 @@ if (read.manifest?.mcpServers?.servers?.docs?.command !== 'node') throw new Erro
 if (read.manifest?.settings?.values?.env?.values?.OASES_API_KEY?.redacted !== true) throw new Error('installed package did not redact manifest setting key');
 if (read.settingsFile?.settings?.values?.apiToken?.redacted !== true) throw new Error('installed package did not redact settings.json key');
 if (JSON.stringify(read).includes('should-not-leak')) throw new Error('installed package leaked sensitive plugin settings');
+const pluginStyles = await handleTool(process.cwd(), 'plugin_output_style_list', { plugin: 'capability-plugin' });
+const pluginStyle = pluginStyles.outputStyles?.find((item) => item.name === 'concise');
+if (pluginStyle?.description !== 'Concise package output') throw new Error('installed package could not list plugin output styles');
+const pluginStyleRead = await handleTool(process.cwd(), 'plugin_output_style_read', { plugin: 'capability-plugin', name: 'concise' });
+if (!String(pluginStyleRead.body || '').includes('Keep package output short.')) throw new Error('installed package could not read plugin output styles');
+const installedStyle = await handleTool(process.cwd(), 'plugin_output_style_install', { plugin: 'capability-plugin', name: 'concise', targetName: 'concise-package' });
+if (!installedStyle.installed || installedStyle.path !== '.oases/output-styles/concise-package.md') throw new Error('installed package could not install plugin output styles');
+const workspaceStyles = await handleTool(process.cwd(), 'output_style_list', { maxResults: 20 });
+if (!workspaceStyles.outputStyles?.some((item) => item.path === '.oases/output-styles/concise-package.md')) throw new Error('installed package could not list installed output styles');
+const workspaceStyle = await handleTool(process.cwd(), 'output_style_read', { name: 'concise-package' });
+if (!String(workspaceStyle.body || '').includes('Keep package output short.')) throw new Error('installed package could not read installed output styles');
 await handleTool(process.cwd(), 'plugin_disable', { plugin: 'capability-plugin' });
 const hidden = await handleTool(process.cwd(), 'plugin_capability_list', { maxResults: 20 });
 if (hidden.capabilities?.some((item) => item.plugin === 'capability-plugin')) throw new Error('plugin_capability_list should hide disabled plugins by default');
 const visible = await handleTool(process.cwd(), 'plugin_capability_list', { includeDisabled: true, maxResults: 20 });
 if (!visible.capabilities?.some((item) => item.plugin === 'capability-plugin')) throw new Error('plugin_capability_list includeDisabled should include disabled plugins');
+const hiddenStyles = await handleTool(process.cwd(), 'plugin_output_style_list', { maxResults: 20 });
+if (hiddenStyles.outputStyles?.some((item) => item.plugin === 'capability-plugin')) throw new Error('plugin_output_style_list should hide disabled plugins by default');
+const visibleStyles = await handleTool(process.cwd(), 'plugin_output_style_list', { includeDisabled: true, maxResults: 20 });
+if (!visibleStyles.outputStyles?.some((item) => item.plugin === 'capability-plugin')) throw new Error('plugin_output_style_list includeDisabled should include disabled plugins');
 let blocked = false;
 try { await handleTool(process.cwd(), 'plugin_capability_read', { plugin: 'capability-plugin' }); } catch { blocked = true; }
 if (!blocked) throw new Error('plugin_capability_read should hide disabled plugins by default');
+let styleBlocked = false;
+try { await handleTool(process.cwd(), 'plugin_output_style_read', { plugin: 'capability-plugin', name: 'concise' }); } catch { styleBlocked = true; }
+if (!styleBlocked) throw new Error('plugin_output_style_read should hide disabled plugins by default');
 `,
   ], installRoot);
   await run(process.execPath, [

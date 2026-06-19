@@ -2,7 +2,7 @@ export const DEFAULT_PORT = 8787;
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_SESSION_EVENTS = 300;
-export const VERSION = "0.1.7";
+export const VERSION = "0.1.18";
 export const RUNTIME_SOURCE = "ocli";
 export const BRIDGE_NAME = "Oases desktop bridge";
 
@@ -21,11 +21,25 @@ export const PROJECT_TOOL_NAMES = new Set([
   "edit_file",
   "delete_file",
   "fetch_url",
+  "web_search",
+  "mcp_list",
+  "mcp_call",
+  "mcp_resources_list",
+  "mcp_resource_read",
   "run_command",
   "run_python",
   "todo_write",
+  "todo_read",
+  "settings_list",
+  "settings_read",
+  "settings_write",
+  "memory_list",
+  "memory_read",
+  "memory_write",
   "command_list",
   "command_read",
+  "output_style_list",
+  "output_style_read",
   "skill_list",
   "skill_read",
   "skill_asset_list",
@@ -38,6 +52,9 @@ export const PROJECT_TOOL_NAMES = new Set([
   "plugin_command_list",
   "plugin_command_read",
   "plugin_command_install",
+  "plugin_output_style_list",
+  "plugin_output_style_read",
+  "plugin_output_style_install",
   "plugin_hook_list",
   "plugin_hook_read",
   "plugin_agent_list",
