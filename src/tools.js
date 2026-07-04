@@ -34,6 +34,15 @@ const WORKSPACE_SETTINGS_PATHS = [
   ".claude/settings.local.json",
 ];
 const MEMORY_SCOPES = new Set(["project", "team", "private"]);
+const ROUTE_PREVIEW_DEFAULT_POLICY = Object.freeze({
+  enabled: true,
+  includeAgents: true,
+  autoMcpCalls: false,
+  limits: { skills: 3, commands: 2, memories: 4, agents: 2, frameworks: 2, mcpTools: 4, mcpResources: 4 },
+  discovery: { skills: 80, pluginSkills: 80, commands: 50, pluginCommands: 50, memories: 100, agents: 50, pluginAgents: 50, frameworks: 50 },
+  memorySearch: { maxResults: 8, maxChars: 600 },
+  minScores: { skill: 8, command: 8, memory: 4, agent: 8, framework: 8, mcp: 8 },
+});
 
 function truncateText(text, limit) {
   const value = String(text || "");
@@ -668,6 +677,54 @@ function memoryPathFromName(name, scope = "project") {
   return `.oases/memory/${normalizeMemoryScope(scope)}/${normalizeMemoryName(name, "memory_write")}.md`;
 }
 
+function normalizeMemoryLinks(value) {
+  const rawLinks = Array.isArray(value)
+    ? value
+    : typeof value === "string" && value.trim()
+      ? value.split(",")
+      : [];
+  const links = [];
+  const seen = new Set();
+  for (const raw of rawLinks) {
+    const link = String(raw || "").trim();
+    if (!link || seen.has(link)) continue;
+    seen.add(link);
+    links.push(link.slice(0, 240));
+    if (links.length >= 50) break;
+  }
+  return links;
+}
+
+function mergeMemoryLinks(...values) {
+  return normalizeMemoryLinks(values.flatMap((value) => normalizeMemoryLinks(value)));
+}
+
+function extractMemoryBodyLinks(content = "") {
+  const text = String(content || "");
+  const wikiLinks = [];
+  const markdownLinks = [];
+  const seenWiki = new Set();
+  const seenMarkdown = new Set();
+  for (const match of text.matchAll(/\[\[([^\]\n]{1,240})\]\]/g)) {
+    const rawTarget = String(match[1] || "").trim();
+    const [targetPart, labelPart] = rawTarget.split("|", 2);
+    const target = targetPart.trim();
+    if (!target || seenWiki.has(target)) continue;
+    seenWiki.add(target);
+    wikiLinks.push({ target, ...(labelPart?.trim() ? { label: labelPart.trim() } : {}) });
+    if (wikiLinks.length >= 50) break;
+  }
+  for (const match of text.matchAll(/\[([^\]\n]{1,160})\]\(([^)\s]{1,300})\)/g)) {
+    const label = String(match[1] || "").trim();
+    const target = String(match[2] || "").trim();
+    if (!target || seenMarkdown.has(target)) continue;
+    seenMarkdown.add(target);
+    markdownLinks.push({ target, ...(label ? { label } : {}) });
+    if (markdownLinks.length >= 50) break;
+  }
+  return { wikiLinks, markdownLinks };
+}
+
 function normalizeMemoryMetadata(file, content = "") {
   const parsed = parseMarkdownFrontmatter(content);
   const fallbackName = path.basename(file, path.extname(file));
@@ -679,6 +736,8 @@ function normalizeMemoryMetadata(file, content = "") {
     : typeof parsed.metadata.tags === "string" && parsed.metadata.tags
       ? parsed.metadata.tags.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 20)
       : [];
+  const links = normalizeMemoryLinks(parsed.metadata.links || parsed.metadata.related);
+  const bodyLinks = extractMemoryBodyLinks(parsed.body);
   return {
     id: `${scope}:${metadataName || fallbackName}`,
     name: metadataName || fallbackName,
@@ -686,6 +745,9 @@ function normalizeMemoryMetadata(file, content = "") {
     description: typeof parsed.metadata.description === "string" ? parsed.metadata.description : "",
     scope,
     tags,
+    links,
+    wikiLinks: bodyLinks.wikiLinks,
+    markdownLinks: bodyLinks.markdownLinks,
     path: file,
     metadata: parsed.metadata,
   };
@@ -780,6 +842,566 @@ async function readMemory(root, body = {}) {
   };
 }
 
+function tokenizeMemoryQuery(value) {
+  const lower = String(value || "").toLowerCase();
+  const matches = lower.match(/[a-z0-9][a-z0-9._-]{1,}|[\u4e00-\u9fff]{2,}/g) || [];
+  const ignored = new Set(["the", "and", "for", "with", "this", "that", "from", "into", "project", "memory", "oases", "ocli", "smoke", "测试", "项目", "记忆", "搜索"]);
+  const terms = [];
+  const seen = new Set();
+  for (const term of matches) {
+    if (ignored.has(term) || seen.has(term)) continue;
+    seen.add(term);
+    terms.push(term);
+    if (terms.length >= 80) break;
+  }
+  return terms;
+}
+
+function scoreMemorySearchResult(memory, content, queryTerms) {
+  const titleText = [memory.name, memory.title].join(" ").toLowerCase();
+  const metadataText = [memory.description, memory.scope, ...(Array.isArray(memory.tags) ? memory.tags : []), ...(Array.isArray(memory.links) ? memory.links : [])].join(" ").toLowerCase();
+  const bodyText = String(content || "").toLowerCase();
+  let score = 0;
+  const matchedTerms = [];
+  for (const term of queryTerms) {
+    if (!term) continue;
+    let termScore = 0;
+    if (titleText.includes(term)) termScore += 12;
+    if (metadataText.includes(term)) termScore += 7;
+    const bodyMatches = bodyText.split(term).length - 1;
+    if (bodyMatches > 0) termScore += Math.min(10, bodyMatches * 2);
+    if (termScore > 0) matchedTerms.push(term);
+    score += termScore;
+  }
+  if (matchedTerms.length >= 2) score += matchedTerms.length * 2;
+  return { score, matchedTerms };
+}
+
+function buildMemorySearchSnippet(content, queryTerms, maxChars) {
+  const raw = String(content || "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  const firstMatch = queryTerms
+    .map((term) => lower.indexOf(term))
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+  const limit = Math.max(120, Math.min(2000, Number(maxChars) || 600));
+  const start = firstMatch === undefined ? 0 : Math.max(0, firstMatch - Math.floor(limit / 3));
+  const snippet = raw.slice(start, start + limit);
+  return `${start > 0 ? "... " : ""}${snippet}${start + limit < raw.length ? " ..." : ""}`;
+}
+
+function memoryLinkTargets(memory) {
+  return [
+    ...(Array.isArray(memory.links) ? memory.links : []),
+    ...(Array.isArray(memory.wikiLinks) ? memory.wikiLinks.map((link) => link.target) : []),
+    ...(Array.isArray(memory.markdownLinks) ? memory.markdownLinks.map((link) => link.target) : []),
+  ].filter(Boolean);
+}
+
+function memoryTargetAliases(memory) {
+  return [
+    memory.id,
+    memory.name,
+    memory.title,
+    memory.path,
+    path.basename(memory.path || "", ".md"),
+    `${memory.scope}:${memory.name}`,
+  ].filter(Boolean).map((item) => String(item).toLowerCase());
+}
+
+function memoryTextAliases(memory) {
+  return [
+    memory.id,
+    memory.name,
+    memory.title,
+    path.basename(memory.path || "", ".md"),
+    `${memory.scope}:${memory.name}`,
+  ]
+    .filter(Boolean)
+    .map((item) => String(item).trim())
+    .filter((item) => item.length >= 3);
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function textMentionsMemoryAlias(text, alias) {
+  const haystack = String(text || "").toLowerCase();
+  const needle = String(alias || "").toLowerCase();
+  if (!haystack || !needle) return false;
+  if (/^[a-z0-9._:-]+$/i.test(needle)) {
+    return new RegExp(`(^|[^a-z0-9._:-])${escapeRegExp(needle)}([^a-z0-9._:-]|$)`, "i").test(haystack);
+  }
+  return haystack.includes(needle);
+}
+
+async function inferMemoryAutoLinks(root, body = {}, targetPath = "") {
+  if (body.autoLink === false || body.autoLinks === false) return [];
+  const scope = normalizeMemoryScope(body.scope);
+  const text = [
+    body.title,
+    body.name,
+    body.description,
+    Array.isArray(body.tags) ? body.tags.join(" ") : body.tags,
+    body.content || body.body,
+  ].filter(Boolean).join("\n");
+  if (!text.trim()) return [];
+  const listed = await listMemories(root, { maxResults: 300 });
+  const inferred = [];
+  const seen = new Set();
+  for (const memory of listed.memories || []) {
+    if (!memory?.path || memory.path === targetPath) continue;
+    if (body.scope && memory.scope !== scope) continue;
+    if (!memoryTextAliases(memory).some((alias) => textMentionsMemoryAlias(text, alias))) continue;
+    const link = `${memory.scope}:${memory.name}`;
+    const key = link.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    inferred.push(link);
+    if (inferred.length >= 20) break;
+  }
+  return inferred;
+}
+
+function buildMemoryBacklinks(memories) {
+  const backlinks = new Map();
+  const aliases = new Map();
+  for (const memory of memories) {
+    for (const alias of memoryTargetAliases(memory)) {
+      if (!aliases.has(alias)) aliases.set(alias, memory.path);
+    }
+  }
+  for (const source of memories) {
+    for (const rawTarget of memoryLinkTargets(source)) {
+      const normalizedTarget = String(rawTarget || "").trim().toLowerCase();
+      const targetPath = aliases.get(normalizedTarget)
+        || aliases.get(normalizedTarget.replace(/\.md$/i, ""))
+        || (normalizedTarget.startsWith(".oases/memory/") ? rawTarget : "");
+      if (!targetPath) continue;
+      const entries = backlinks.get(targetPath) || [];
+      entries.push({ path: source.path, name: source.name, title: source.title, scope: source.scope });
+      backlinks.set(targetPath, entries);
+    }
+  }
+  return backlinks;
+}
+
+async function searchMemories(root, body = {}) {
+  const query = String(body.query || body.q || "").trim();
+  if (!query) throw new Error("memory_search requires query.");
+  const queryTerms = tokenizeMemoryQuery(query);
+  if (!queryTerms.length) throw new Error("memory_search query did not contain searchable terms.");
+  const maxResults = Math.max(1, Math.min(50, Number(body.maxResults) || 8));
+  const maxChars = Math.max(120, Math.min(2000, Number(body.maxChars) || 600));
+  const listed = await listMemories(root, { scope: body.scope, maxResults: 300 });
+  const backlinks = buildMemoryBacklinks(listed.memories || []);
+  const results = [];
+  for (const memory of listed.memories || []) {
+    try {
+      const target = workspacePath(root, memory.path);
+      const info = await stat(target);
+      if (!info.isFile() || info.size > 512 * 1024) continue;
+      const content = await readFile(target, "utf8");
+      const parsed = parseMarkdownFrontmatter(content);
+      const { score, matchedTerms } = scoreMemorySearchResult(memory, content, queryTerms);
+      if (score <= 0) continue;
+      results.push({
+        memory,
+        path: memory.path,
+        score,
+        matchedTerms,
+        snippet: buildMemorySearchSnippet(parsed.body || content, queryTerms, maxChars),
+        links: memoryLinkTargets(memory),
+        backlinks: backlinks.get(memory.path) || [],
+        bytes: info.size,
+        mtimeMs: info.mtimeMs,
+      });
+    } catch {
+      // Ignore unreadable memory files.
+    }
+  }
+  results.sort((a, b) => b.score - a.score || (b.mtimeMs || 0) - (a.mtimeMs || 0) || a.path.localeCompare(b.path));
+  return {
+    query,
+    terms: queryTerms,
+    memories: results.slice(0, maxResults),
+    count: Math.min(results.length, maxResults),
+    totalMatches: results.length,
+    root: ".oases/memory",
+    truncated: results.length > maxResults,
+  };
+}
+
+function cloneRoutePreviewPolicy() {
+  return {
+    enabled: ROUTE_PREVIEW_DEFAULT_POLICY.enabled,
+    includeAgents: ROUTE_PREVIEW_DEFAULT_POLICY.includeAgents,
+    autoMcpCalls: ROUTE_PREVIEW_DEFAULT_POLICY.autoMcpCalls,
+    limits: { ...ROUTE_PREVIEW_DEFAULT_POLICY.limits },
+    discovery: { ...ROUTE_PREVIEW_DEFAULT_POLICY.discovery },
+    memorySearch: { ...ROUTE_PREVIEW_DEFAULT_POLICY.memorySearch },
+    minScores: { ...ROUTE_PREVIEW_DEFAULT_POLICY.minScores },
+    sourcePaths: [],
+  };
+}
+
+function normalizeRoutePreviewNumber(value, fallback, min = 0, max = 500) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function normalizeRoutePreviewScore(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, Math.min(1000, number));
+}
+
+function mergeRoutePreviewPolicy(policy, patch = {}, sourcePath = "") {
+  if (!isPlainObject(patch)) return policy;
+  const next = {
+    ...policy,
+    limits: { ...policy.limits },
+    discovery: { ...policy.discovery },
+    memorySearch: { ...policy.memorySearch },
+    minScores: { ...policy.minScores },
+    sourcePaths: [...(policy.sourcePaths || [])],
+  };
+  if (typeof patch.enabled === "boolean") next.enabled = patch.enabled;
+  if (typeof patch.auto === "boolean") next.enabled = patch.auto;
+  if (typeof patch.includeAgents === "boolean") next.includeAgents = patch.includeAgents;
+  if (typeof patch.agentRouting === "boolean") next.includeAgents = patch.agentRouting;
+  if (typeof patch.autoMcpCalls === "boolean") next.autoMcpCalls = patch.autoMcpCalls;
+  if (typeof patch.mcpAutoCalls === "boolean") next.autoMcpCalls = patch.mcpAutoCalls;
+  for (const key of Object.keys(next.limits)) {
+    if (patch.limits?.[key] !== undefined) next.limits[key] = normalizeRoutePreviewNumber(patch.limits[key], next.limits[key], 0, 50);
+  }
+  for (const key of Object.keys(next.discovery)) {
+    if (patch.discovery?.[key] !== undefined) next.discovery[key] = normalizeRoutePreviewNumber(patch.discovery[key], next.discovery[key], 1, 500);
+  }
+  for (const key of Object.keys(next.memorySearch)) {
+    if (patch.memorySearch?.[key] !== undefined) {
+      next.memorySearch[key] = key === "maxChars"
+        ? normalizeRoutePreviewNumber(patch.memorySearch[key], next.memorySearch[key], 120, 2000)
+        : normalizeRoutePreviewNumber(patch.memorySearch[key], next.memorySearch[key], 0, 50);
+    }
+  }
+  const scorePatch = isPlainObject(patch.minScores) ? patch.minScores : isPlainObject(patch.minimumScores) ? patch.minimumScores : undefined;
+  if (scorePatch) {
+    for (const key of Object.keys(next.minScores)) {
+      if (scorePatch[key] !== undefined) next.minScores[key] = normalizeRoutePreviewScore(scorePatch[key], next.minScores[key]);
+    }
+  }
+  if (sourcePath && !next.sourcePaths.includes(sourcePath)) next.sourcePaths.push(sourcePath);
+  return next;
+}
+
+async function readRoutePreviewPolicy(root, body = {}) {
+  let policy = cloneRoutePreviewPolicy();
+  for (const settingsPath of [".oases/settings.json", ".oases/settings.local.json"]) {
+    try {
+      const settings = await summarizeWorkspaceSettingsFile(root, settingsPath);
+      policy = mergeRoutePreviewPolicy(policy, settings.safeValues?.capabilityRouting, settingsPath);
+    } catch {
+      // Missing settings files are normal.
+    }
+  }
+  policy = mergeRoutePreviewPolicy(policy, body.capabilityRouting, body.capabilityRouting ? "request" : "");
+  return policy;
+}
+
+function routePreviewCandidateText(candidate = {}, type = "") {
+  const arrays = [
+    candidate.tags,
+    candidate.links,
+    candidate.routingTerms,
+    candidate.agents,
+    candidate.skills,
+    candidate.commands,
+    candidate.memories,
+    candidate.mcpServers,
+    candidate.mcpTools,
+    candidate.mcpResources,
+    candidate.agentRoles,
+    candidate.handoffs,
+    candidate.verificationGates,
+  ].filter(Array.isArray).flat();
+  const inputSchemaKeys = candidate.inputSchema?.properties && typeof candidate.inputSchema.properties === "object"
+    ? Object.keys(candidate.inputSchema.properties)
+    : [];
+  return [
+    type,
+    candidate.id,
+    candidate.name,
+    candidate.title,
+    candidate.description,
+    candidate.path,
+    candidate.source,
+    candidate.plugin,
+    candidate.scope,
+    candidate.server,
+    candidate.tool,
+    candidate.uri,
+    candidate.root,
+    ...arrays,
+    ...inputSchemaKeys,
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function scoreRoutePreviewCandidate(candidate, type, terms) {
+  const nameText = [candidate.name, candidate.title, candidate.id, candidate.tool, candidate.uri].filter(Boolean).join(" ").toLowerCase();
+  const pathText = [candidate.path, candidate.server, candidate.source, candidate.plugin, candidate.scope, candidate.root].filter(Boolean).join(" ").toLowerCase();
+  const fullText = routePreviewCandidateText(candidate, type);
+  let score = 0;
+  const matchedTerms = [];
+  for (const term of terms) {
+    let termScore = 0;
+    if (nameText.includes(term)) termScore += 14;
+    if (String(candidate.description || "").toLowerCase().includes(term)) termScore += 9;
+    if (pathText.includes(term)) termScore += 5;
+    if (fullText.includes(term)) termScore += 3;
+    if (termScore > 0) {
+      matchedTerms.push(term);
+      score += termScore;
+    }
+  }
+  if (matchedTerms.length >= 2) score += matchedTerms.length * 2;
+  return { score, matchedTerms };
+}
+
+function safeRoutePreviewCandidate(candidate = {}, type, score, matchedTerms = []) {
+  const inputSchemaKeys = candidate.inputSchema?.properties && typeof candidate.inputSchema.properties === "object"
+    ? Object.keys(candidate.inputSchema.properties).slice(0, 20)
+    : [];
+  return {
+    type,
+    name: String(candidate.name || candidate.tool || candidate.title || candidate.uri || candidate.path || type),
+    ...(candidate.title ? { title: String(candidate.title) } : {}),
+    ...(candidate.description ? { description: String(candidate.description).slice(0, 500) } : {}),
+    ...(candidate.path ? { path: String(candidate.path) } : {}),
+    ...(candidate.source ? { source: String(candidate.source) } : {}),
+    ...(candidate.plugin ? { plugin: String(candidate.plugin) } : {}),
+    ...(candidate.scope ? { scope: String(candidate.scope) } : {}),
+    ...(candidate.server ? { server: String(candidate.server) } : {}),
+    ...(candidate.tool ? { tool: String(candidate.tool) } : {}),
+    ...(candidate.uri ? { uri: String(candidate.uri) } : {}),
+    ...(Array.isArray(candidate.tags) && candidate.tags.length ? { tags: candidate.tags.slice(0, 12) } : {}),
+    ...(Array.isArray(candidate.links) && candidate.links.length ? { links: candidate.links.slice(0, 12) } : {}),
+    ...(Array.isArray(candidate.agentRoles) && candidate.agentRoles.length ? { agentRoles: candidate.agentRoles.slice(0, 12) } : {}),
+    ...(Array.isArray(candidate.handoffs) && candidate.handoffs.length ? { handoffs: candidate.handoffs.slice(0, 12) } : {}),
+    ...(Array.isArray(candidate.verificationGates) && candidate.verificationGates.length ? { verificationGates: candidate.verificationGates.slice(0, 12) } : {}),
+    ...(inputSchemaKeys.length ? { inputSchemaKeys } : {}),
+    score,
+    matchedTerms,
+  };
+}
+
+function selectRoutePreviewCandidates(candidates, type, terms, limit, minScore) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .map((candidate) => {
+      const scored = scoreRoutePreviewCandidate(candidate, type, terms);
+      return { candidate, ...scored };
+    })
+    .filter((item) => item.score >= minScore)
+    .sort((a, b) => b.score - a.score || routePreviewCandidateText(a.candidate, type).localeCompare(routePreviewCandidateText(b.candidate, type)))
+    .slice(0, Math.max(0, Number(limit) || 0))
+    .map((item) => safeRoutePreviewCandidate(item.candidate, type, item.score, item.matchedTerms));
+}
+
+function stableRoutePreviewValue(value) {
+  if (Array.isArray(value)) return value.map(stableRoutePreviewValue);
+  if (!isPlainObject(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableRoutePreviewValue(value[key])]),
+  );
+}
+
+function routePreviewFingerprint(value) {
+  const text = JSON.stringify(stableRoutePreviewValue(value));
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function routePreviewSnapshotKey(candidate = {}) {
+  if (candidate.server && (candidate.tool || candidate.name)) return `${candidate.server}/${candidate.tool || candidate.name}`;
+  if (candidate.server && candidate.uri) return `${candidate.server}/${candidate.uri}`;
+  if (candidate.path) return String(candidate.path);
+  if (candidate.plugin && candidate.name) return `${candidate.plugin}:${candidate.name}`;
+  return String(candidate.name || candidate.title || candidate.uri || "").trim();
+}
+
+function buildRoutePreviewSnapshot({ terms, policy, candidateCounts, selectedCounts, selected }) {
+  const categories = Object.fromEntries(Object.keys(selected || {}).map((key) => [
+    key,
+    {
+      candidateCount: candidateCounts[key] || 0,
+      selectedCount: selectedCounts[key] || 0,
+      threshold: key === "mcpTools" || key === "mcpResources" ? policy.minScores.mcp : policy.minScores[key] || 0,
+      selectedKeys: (selected[key] || []).map(routePreviewSnapshotKey).filter(Boolean).slice(0, 50),
+    },
+  ]));
+  const snapshot = {
+    schemaVersion: 1,
+    comparableWith: "agent_routing",
+    totalCandidates: Object.values(candidateCounts).reduce((sum, count) => sum + count, 0),
+    totalSelected: Object.values(selectedCounts).reduce((sum, count) => sum + count, 0),
+    categories,
+  };
+  snapshot.fingerprint = routePreviewFingerprint({
+    queryTerms: terms.slice(0, 40),
+    policy,
+    categories,
+  });
+  return snapshot;
+}
+
+function routePreviewMcpToolCandidate(tool = {}) {
+  const displayName = tool.name || tool.tool || "";
+  return {
+    ...tool,
+    name: displayName,
+    tool: displayName,
+    server: tool.server || tool.serverName || "",
+    description: tool.description || "",
+  };
+}
+
+function routePreviewMcpResourceCandidate(resource = {}) {
+  return {
+    ...resource,
+    name: resource.name || resource.uri || "",
+    uri: resource.uri || "",
+    server: resource.server || resource.serverName || "",
+    description: resource.description || resource.mimeType || "",
+  };
+}
+
+async function routePreviewDiscovery(root, policy, queryTerms, query, options = {}) {
+  const memorySearchArgs = {
+    query: queryTerms.join(" "),
+    maxResults: policy.memorySearch.maxResults,
+    maxChars: policy.memorySearch.maxChars,
+    ...(options.scope ? { scope: options.scope } : {}),
+  };
+  const tasks = [
+    ["skill_list", () => listSkills(root, { maxResults: policy.discovery.skills })],
+    ["plugin_skill_list", () => listPluginSkills(root, { maxResults: policy.discovery.pluginSkills })],
+    ["command_list", () => listCommands(root, { maxResults: policy.discovery.commands })],
+    ["plugin_command_list", () => listPluginCommands(root, { maxResults: policy.discovery.pluginCommands })],
+    ["memory_list", () => listMemories(root, { scope: options.scope, maxResults: policy.discovery.memories })],
+    ["memory_search", () => policy.memorySearch.maxResults > 0 ? searchMemories(root, memorySearchArgs) : Promise.resolve(undefined)],
+    ["agent_list", () => policy.includeAgents === false ? Promise.resolve(undefined) : listAgents(root, { maxResults: policy.discovery.agents })],
+    ["plugin_agent_list", () => policy.includeAgents === false ? Promise.resolve(undefined) : listPluginAgents(root, { maxResults: policy.discovery.pluginAgents })],
+    ["agent_framework_list", () => policy.includeAgents === false ? Promise.resolve(undefined) : listAgentFrameworks(root, { maxResults: policy.discovery.frameworks })],
+    ["mcp_list", () => listMcpTools(root)],
+    ["mcp_resources_list", () => listMcpResources(root)],
+  ];
+  const settled = await Promise.allSettled(tasks.map(([, task]) => task()));
+  const data = {};
+  const errors = [];
+  for (let index = 0; index < tasks.length; index += 1) {
+    const [name] = tasks[index];
+    const result = settled[index];
+    if (result.status === "fulfilled") data[name] = result.value;
+    else errors.push({ source: name, message: result.reason instanceof Error ? result.reason.message : String(result.reason || "discovery failed") });
+  }
+  const searchedMemories = (Array.isArray(data.memory_search?.memories) ? data.memory_search.memories : [])
+    .map((result) => ({
+      ...(result.memory && typeof result.memory === "object" ? result.memory : {}),
+      score: Number(result.score) || 0,
+      matchedTerms: Array.isArray(result.matchedTerms) ? result.matchedTerms : [],
+      path: result.path || result.memory?.path || "",
+      snippet: result.snippet || "",
+      links: result.links || result.memory?.links || [],
+    }))
+    .filter((memory) => memory.path);
+  const memoryCandidates = searchedMemories.length ? searchedMemories : (data.memory_list?.memories || []);
+  return {
+    query,
+    terms: queryTerms,
+    data,
+    errors,
+    candidates: {
+      skills: [...(data.skill_list?.skills || []), ...(data.plugin_skill_list?.skills || [])],
+      commands: [...(data.command_list?.commands || []), ...(data.plugin_command_list?.commands || [])],
+      memories: memoryCandidates,
+      agents: [...(data.agent_list?.agents || []), ...(data.plugin_agent_list?.agents || [])],
+      frameworks: data.agent_framework_list?.frameworks || [],
+      mcpTools: (data.mcp_list?.tools || []).filter((tool) => tool?.name && tool.name !== "__error__").map(routePreviewMcpToolCandidate),
+      mcpResources: (data.mcp_resources_list?.resources || []).filter((resource) => resource?.uri && resource.uri !== "__error__").map(routePreviewMcpResourceCandidate),
+    },
+    memorySearch: data.memory_search,
+  };
+}
+
+async function previewCapabilityRoute(root, body = {}) {
+  const query = String(body.query || body.prompt || body.task || "").trim();
+  if (!query) throw new Error("capability_route_preview requires query, prompt, or task.");
+  const terms = tokenizeMemoryQuery(query);
+  if (!terms.length) throw new Error("capability_route_preview query did not contain searchable terms.");
+  const policy = await readRoutePreviewPolicy(root, body);
+  if (policy.enabled === false) {
+    return {
+      query,
+      terms,
+      policy,
+      selected: { skills: [], commands: [], memories: [], agents: [], frameworks: [], mcpTools: [], mcpResources: [] },
+      diagnostics: { disabled: true, reason: "capabilityRouting.enabled is false" },
+    };
+  }
+  const discovery = await routePreviewDiscovery(root, policy, terms, query, { scope: body.scope });
+  const selectedMemories = (Array.isArray(discovery.memorySearch?.memories) && discovery.memorySearch.memories.length)
+    ? discovery.memorySearch.memories
+      .filter((item) => (Number(item.score) || 0) >= policy.minScores.memory)
+      .slice(0, policy.limits.memories)
+      .map((item) => safeRoutePreviewCandidate({
+        ...(item.memory || {}),
+        path: item.path || item.memory?.path || "",
+        links: item.links || item.memory?.links || [],
+      }, "memory", Number(item.score) || 0, Array.isArray(item.matchedTerms) ? item.matchedTerms : []))
+    : selectRoutePreviewCandidates(discovery.candidates.memories, "memory", terms, policy.limits.memories, policy.minScores.memory);
+  const selected = {
+    skills: selectRoutePreviewCandidates(discovery.candidates.skills, "skill", terms, policy.limits.skills, policy.minScores.skill),
+    commands: selectRoutePreviewCandidates(discovery.candidates.commands, "command", terms, policy.limits.commands, policy.minScores.command),
+    memories: selectedMemories,
+    agents: policy.includeAgents === false ? [] : selectRoutePreviewCandidates(discovery.candidates.agents, "agent", terms, policy.limits.agents, policy.minScores.agent),
+    frameworks: policy.includeAgents === false ? [] : selectRoutePreviewCandidates(discovery.candidates.frameworks, "framework", terms, policy.limits.frameworks, policy.minScores.framework),
+    mcpTools: selectRoutePreviewCandidates(discovery.candidates.mcpTools, "mcp", terms, policy.limits.mcpTools, policy.minScores.mcp),
+    mcpResources: selectRoutePreviewCandidates(discovery.candidates.mcpResources, "mcp", terms, policy.limits.mcpResources, policy.minScores.mcp),
+  };
+  const candidateCounts = Object.fromEntries(Object.entries(discovery.candidates).map(([key, value]) => [key, Array.isArray(value) ? value.length : 0]));
+  const selectedCounts = Object.fromEntries(Object.entries(selected).map(([key, value]) => [key, value.length]));
+  const snapshot = buildRoutePreviewSnapshot({ terms, policy, candidateCounts, selectedCounts, selected });
+  return {
+    query,
+    terms,
+    policy,
+    selected,
+    errors: discovery.errors,
+    diagnostics: {
+      candidateCounts,
+      selectedCounts,
+      totalCandidates: Object.values(candidateCounts).reduce((sum, count) => sum + count, 0),
+      totalSelected: Object.values(selectedCounts).reduce((sum, count) => sum + count, 0),
+      memorySearch: discovery.memorySearch ? {
+        totalMatches: discovery.memorySearch.totalMatches || 0,
+        count: discovery.memorySearch.count || 0,
+        truncated: discovery.memorySearch.truncated === true,
+      } : undefined,
+      snapshot,
+      autoMcpCalls: policy.autoMcpCalls,
+      note: "Preview ranks readable capabilities only; it does not start an agent session or auto-call MCP tools.",
+    },
+  };
+}
+
 function formatMemoryMarkdown(body = {}) {
   const title = String(body.title || body.name || "Memory").trim();
   const description = String(body.description || "").trim();
@@ -789,6 +1411,7 @@ function formatMemoryMarkdown(body = {}) {
     : typeof body.tags === "string" && body.tags.trim()
       ? body.tags.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 20)
       : [];
+  const links = normalizeMemoryLinks(body.links || body.related);
   const content = String(body.content || body.body || "").trim();
   if (!title) throw new Error("memory_write requires title or name.");
   if (!content) throw new Error("memory_write requires content or body.");
@@ -799,6 +1422,7 @@ function formatMemoryMarkdown(body = {}) {
     ...(description ? [`description: ${description.replace(/\r?\n/g, " ")}`] : []),
     `scope: ${scope}`,
     ...(tags.length ? [`tags: [${tags.map((tag) => JSON.stringify(tag)).join(", ")}]`] : []),
+    ...(links.length ? [`links: [${links.map((link) => JSON.stringify(link)).join(", ")}]`] : []),
     `updatedAt: ${new Date().toISOString()}`,
     "---",
     "",
@@ -815,7 +1439,8 @@ async function writeMemory(root, body = {}) {
   const target = workspacePath(root, normalized);
   if (await fileExists(target) && body.overwrite !== true) throw new Error(`Memory already exists: ${normalized}. Pass overwrite: true to replace it.`);
   await mkdir(path.dirname(target), { recursive: true });
-  const content = formatMemoryMarkdown({ ...body, scope });
+  const autoLinks = await inferMemoryAutoLinks(root, { ...body, scope }, normalized);
+  const content = formatMemoryMarkdown({ ...body, scope, links: mergeMemoryLinks(body.links || body.related, autoLinks) });
   await writeFile(target, content, "utf8");
   const info = await stat(target);
   return {
@@ -823,6 +1448,7 @@ async function writeMemory(root, body = {}) {
     path: normalized,
     bytes: info.size,
     memory: normalizeMemoryMetadata(normalized, content),
+    autoLinks,
     artifacts: [fileArtifact(normalized, info, "memory_file")],
   };
 }
@@ -1494,6 +2120,82 @@ function summarizeSettingsShape(settings) {
   };
 }
 
+function summarizeSafeSettingsValues(settings) {
+  if (!isPlainObject(settings)) return {};
+  const safeValues = {};
+  if (isPlainObject(settings.memory)) {
+    const memory = {};
+    if (typeof settings.memory.autoSuggest === "boolean") memory.autoSuggest = settings.memory.autoSuggest;
+    if (typeof settings.memory.autoWrite === "boolean") memory.autoWrite = settings.memory.autoWrite;
+    if (typeof settings.memory.scope === "string" && ["project", "team", "private"].includes(settings.memory.scope)) memory.scope = settings.memory.scope;
+    if (Object.keys(memory).length) safeValues.memory = memory;
+  }
+  if (typeof settings.outputStyle === "string") safeValues.outputStyle = settings.outputStyle.slice(0, 120);
+  const mcpServers = summarizeServerMap(settings.mcpServers);
+  if (mcpServers.count > 0 || isPlainObject(settings.mcpServers)) safeValues.mcpServers = mcpServers;
+  if (typeof settings.contextCompaction === "boolean") {
+    safeValues.contextCompaction = { enabled: settings.contextCompaction };
+  } else if (isPlainObject(settings.contextCompaction)) {
+    const contextCompaction = {};
+    for (const key of ["enabled", "auto", "disable", "disabled"]) {
+      if (typeof settings.contextCompaction[key] === "boolean") contextCompaction[key] = settings.contextCompaction[key];
+    }
+    for (const key of ["maxContextTokens", "contextWindowTokens", "contextWindow", "maxTokens", "windowTokens", "ratio", "thresholdRatio", "compactionRatio", "contextCompactionRatio", "contextCompressionRatio", "recentMessages", "contextRecentMessages", "recentContextMessages", "retainedMessages", "tailMessages"]) {
+      if (typeof settings.contextCompaction[key] === "number") contextCompaction[key] = settings.contextCompaction[key];
+    }
+    if (Object.keys(contextCompaction).length) safeValues.contextCompaction = contextCompaction;
+  }
+  if (isPlainObject(settings.capabilityRouting)) {
+    const capabilityRouting = {};
+    for (const key of ["enabled", "auto", "adaptive", "autoAdaptive", "includeAgents", "agentRouting", "autoMcpCalls", "mcpAutoCalls"]) {
+      if (typeof settings.capabilityRouting[key] === "boolean") capabilityRouting[key] = settings.capabilityRouting[key];
+    }
+    for (const nestedKey of ["limits", "discovery", "memorySearch", "minScores", "minimumScores"]) {
+      if (!isPlainObject(settings.capabilityRouting[nestedKey])) continue;
+      capabilityRouting[nestedKey] = Object.fromEntries(
+        Object.entries(settings.capabilityRouting[nestedKey])
+          .filter(([, value]) => typeof value === "number" || typeof value === "boolean" || typeof value === "string")
+          .slice(0, 40)
+      );
+    }
+    if (Object.keys(capabilityRouting).length) safeValues.capabilityRouting = capabilityRouting;
+  }
+  if (isPlainObject(settings.autoContinue)) {
+    const autoContinue = {};
+    if (typeof settings.autoContinue.enabled === "boolean") autoContinue.enabled = settings.autoContinue.enabled;
+    if (Object.keys(autoContinue).length) safeValues.autoContinue = autoContinue;
+  }
+  return safeValues;
+}
+
+function summarizeServerArgs(value) {
+  if (!Array.isArray(value)) return [];
+  const args = [];
+  let redactNext = false;
+  for (const item of value.slice(0, 80)) {
+    const arg = String(item || "").slice(0, 500);
+    if (redactNext) {
+      args.push("[redacted]");
+      redactNext = false;
+      continue;
+    }
+    if (SENSITIVE_KEY_RE.test(arg)) {
+      const splitIndex = Math.min(
+        ...[arg.indexOf("="), arg.indexOf(":")].filter((index) => index >= 0)
+      );
+      if (Number.isFinite(splitIndex)) {
+        args.push(`${arg.slice(0, splitIndex)}=[redacted]`);
+      } else {
+        args.push(arg);
+        redactNext = true;
+      }
+      continue;
+    }
+    args.push(arg);
+  }
+  return args;
+}
+
 function summarizeServerMap(value) {
   if (!isPlainObject(value)) return { count: 0, names: [], servers: {} };
   const names = Object.keys(value).sort();
@@ -1509,6 +2211,7 @@ function summarizeServerMap(value) {
       command: typeof server.command === "string" ? server.command : undefined,
       transport: typeof server.transport === "string" ? server.transport : undefined,
       url: typeof server.url === "string" ? server.url : undefined,
+      args: summarizeServerArgs(server.args),
       argsCount: Array.isArray(server.args) ? server.args.length : 0,
       envKeys: env ? Object.keys(env).sort() : [],
       keys: Object.keys(server).sort(),
@@ -1709,6 +2412,7 @@ async function summarizeWorkspaceSettingsFile(root, settingsPath) {
     bytes: info.size,
     source: settingsPath.startsWith(".claude/") ? "claude" : "oases",
     settings: summarizeSettingsShape(parsed),
+    safeValues: summarizeSafeSettingsValues(parsed),
   };
 }
 
@@ -1739,6 +2443,20 @@ async function readWorkspaceSettings(root, body = {}) {
     throw new Error("settings_read skips .claude settings unless includeClaude is true.");
   }
   return summarizeWorkspaceSettingsFile(root, normalized);
+}
+
+function mergeMcpServerSettings(existingValue, patchValue) {
+  if (!isPlainObject(patchValue)) return patchValue;
+  const merged = isPlainObject(existingValue) ? { ...existingValue } : {};
+  for (const [name, serverPatch] of Object.entries(patchValue)) {
+    if (serverPatch === null) {
+      delete merged[name];
+      continue;
+    }
+    const existingServer = isPlainObject(merged[name]) ? merged[name] : {};
+    merged[name] = isPlainObject(serverPatch) ? { ...existingServer, ...serverPatch } : serverPatch;
+  }
+  return merged;
 }
 
 async function walkPluginManifestFiles(root, maxResults = 100) {
@@ -2653,9 +3371,12 @@ function normalizeAgentMetadata(file, metadata = {}) {
   const effort = parseEffortValue(metadata.effort);
   const tools = parseCommaSeparatedList(metadata.tools);
   const disallowedTools = parseCommaSeparatedList(metadata.disallowedTools);
+  const mcpTools = parseCommaSeparatedList(metadata.mcpTools);
+  const disallowedMcpTools = parseCommaSeparatedList(metadata.disallowedMcpTools);
   const skills = parseCommaSeparatedList(metadata.skills);
   const commands = parseCommaSeparatedList(metadata.commands);
   const memories = parseCommaSeparatedList(metadata.memories);
+  const frameworks = parseCommaSeparatedList(metadata.frameworks);
   const initialPrompt = typeof metadata.initialPrompt === "string" && metadata.initialPrompt.trim()
     ? metadata.initialPrompt.trim()
     : undefined;
@@ -2671,10 +3392,151 @@ function normalizeAgentMetadata(file, metadata = {}) {
     ...(effort ? { effort } : {}),
     ...(tools ? { tools } : {}),
     ...(disallowedTools ? { disallowedTools } : {}),
+    ...(mcpTools ? { mcpTools } : {}),
+    ...(disallowedMcpTools ? { disallowedMcpTools } : {}),
     ...(skills ? { skills } : {}),
     ...(commands ? { commands } : {}),
     ...(memories ? { memories } : {}),
+    ...(frameworks ? { frameworks } : {}),
     ...(initialPrompt ? { initialPrompt } : {}),
+  };
+}
+
+function normalizeAgentName(value, toolName = "agent_write") {
+  const normalized = String(value || "").trim().replace(/\\+/g, "/").replace(/^\.\//, "");
+  if (!normalized || normalized.includes("/") || normalized === "." || normalized === ".." || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error(`${toolName} name must be a single safe agent name.`);
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(normalized)) throw new Error(`${toolName} name may only contain letters, numbers, dot, underscore, or dash.`);
+  const withoutExtension = normalized.replace(/\.md$/i, "");
+  if (!withoutExtension) throw new Error(`${toolName} name must include a non-empty stem.`);
+  return withoutExtension;
+}
+
+function validateAgentWritePath(agentPath) {
+  const normalized = String(agentPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/agents/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("agent_write can only write Markdown files under .oases/agents.");
+  }
+  if (!/\.md$/i.test(normalized)) throw new Error("agent_write can only write Markdown agent files.");
+  const relative = normalized.slice(".oases/agents/".length);
+  const parts = relative.split("/");
+  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error("agent_write path must stay inside .oases/agents.");
+  }
+  normalizeAgentName(parts.at(-1), "agent_write");
+  return normalized;
+}
+
+function agentPathFromName(name) {
+  return `.oases/agents/${normalizeAgentName(name, "agent_write")}.md`;
+}
+
+function normalizeAgentStringList(value, fieldName, maxItems = 50) {
+  const list = parseCommaSeparatedList(value) || [];
+  const seen = new Set();
+  const normalized = [];
+  for (const item of list) {
+    const text = String(item || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    normalized.push(text);
+    if (normalized.length >= maxItems) break;
+  }
+  if (normalized.some((item) => item.includes("\n") || item.includes("\r"))) {
+    throw new Error(`agent_write ${fieldName} entries must be single-line strings.`);
+  }
+  return normalized;
+}
+
+function normalizeAgentToolList(value, fieldName) {
+  const tools = normalizeAgentStringList(value, fieldName, 100);
+  const unknown = tools.filter((tool) => tool !== "*" && !PROJECT_TOOL_NAMES.has(tool));
+  if (unknown.length) throw new Error(`agent_write ${fieldName} contains unknown tools: ${unknown.join(", ")}`);
+  return tools;
+}
+
+function formatAgentListFrontmatter(key, values) {
+  if (!Array.isArray(values) || !values.length) return [];
+  return [`${key}: [${values.map((item) => JSON.stringify(item)).join(", ")}]`];
+}
+
+function formatAgentBlockFrontmatter(key, value) {
+  const text = String(value || "").trimEnd();
+  if (!text) return [];
+  return [`${key}: |`, ...text.split(/\r?\n/).map((line) => `  ${line}`)];
+}
+
+function formatAgentMarkdown(body = {}, normalizedPath) {
+  const name = normalizeAgentName(body.name || path.basename(normalizedPath, path.extname(normalizedPath)), "agent_write");
+  const title = String(body.title || body.heading || name).trim().replace(/\r?\n/g, " ");
+  const description = String(body.description || "").trim().replace(/\r?\n/g, " ");
+  const agentType = ["general", "explore", "plan", "verify"].includes(body.agentType) ? body.agentType : "";
+  if (body.agentType && !agentType) throw new Error("agent_write agentType must be general, explore, plan, or verify.");
+  const maxTurns = body.maxTurns === undefined || body.maxTurns === null || body.maxTurns === ""
+    ? undefined
+    : parseOptionalPositiveInteger(body.maxTurns, 12);
+  if ((body.maxTurns !== undefined && body.maxTurns !== null && body.maxTurns !== "") && !maxTurns) throw new Error("agent_write maxTurns must be a positive integer.");
+  const background = typeof body.background === "boolean" ? body.background : parseOptionalBoolean(String(body.background ?? ""));
+  const isolation = ["workspace", "worktree"].includes(body.isolation) ? body.isolation : "";
+  if (body.isolation && !isolation) throw new Error("agent_write isolation must be workspace or worktree.");
+  const effort = parseEffortValue(body.effort);
+  if (body.effort && !effort) throw new Error("agent_write effort must be low, medium, high, or max.");
+  const tools = normalizeAgentToolList(body.tools, "tools");
+  const disallowedTools = normalizeAgentToolList(body.disallowedTools, "disallowedTools");
+  const mcpTools = normalizeAgentStringList(body.mcpTools, "mcpTools", 100);
+  const disallowedMcpTools = normalizeAgentStringList(body.disallowedMcpTools, "disallowedMcpTools", 100);
+  const skills = normalizeAgentStringList(body.skills, "skills");
+  const commands = normalizeAgentStringList(body.commands, "commands");
+  const memories = normalizeAgentStringList(body.memories, "memories");
+  const frameworks = normalizeAgentStringList(body.frameworks, "frameworks");
+  const initialPrompt = String(body.initialPrompt || "").trim();
+  const prompt = String(body.prompt || body.content || body.body || "").trim();
+  if (!prompt) throw new Error("agent_write requires prompt, content, or body.");
+  const frontmatter = [
+    "---",
+    `name: ${name}`,
+    ...(description ? [`description: ${description}`] : []),
+    ...(agentType ? [`agentType: ${agentType}`] : []),
+    ...(maxTurns ? [`maxTurns: ${maxTurns}`] : []),
+    ...(typeof background === "boolean" ? [`background: ${background ? "true" : "false"}`] : []),
+    ...(isolation ? [`isolation: ${isolation}`] : []),
+    ...(effort ? [`effort: ${effort}`] : []),
+    ...formatAgentListFrontmatter("tools", tools),
+    ...formatAgentListFrontmatter("disallowedTools", disallowedTools),
+    ...formatAgentListFrontmatter("mcpTools", mcpTools),
+    ...formatAgentListFrontmatter("disallowedMcpTools", disallowedMcpTools),
+    ...formatAgentListFrontmatter("skills", skills),
+    ...formatAgentListFrontmatter("commands", commands),
+    ...formatAgentListFrontmatter("memories", memories),
+    ...formatAgentListFrontmatter("frameworks", frameworks),
+    ...formatAgentBlockFrontmatter("initialPrompt", initialPrompt),
+    `updatedAt: ${new Date().toISOString()}`,
+    "---",
+    "",
+  ].join("\n");
+  const bodyContent = prompt.startsWith("#") ? prompt : `# ${title || name}\n\n${prompt}`;
+  return `${frontmatter}${bodyContent.trimEnd()}\n`;
+}
+
+async function writeAgent(root, body = {}) {
+  const normalized = body.path ? validateAgentWritePath(body.path) : agentPathFromName(body.name || body.title || body.heading);
+  const target = workspacePath(root, normalized);
+  if (await fileExists(target) && body.overwrite !== true) throw new Error(`Agent already exists: ${normalized}. Pass overwrite: true to replace it.`);
+  await mkdir(path.dirname(target), { recursive: true });
+  const content = formatAgentMarkdown(body, normalized);
+  await writeFile(target, content, "utf8");
+  const info = await stat(target);
+  const parsed = parseMarkdownFrontmatter(content);
+  return {
+    written: true,
+    path: normalized,
+    bytes: info.size,
+    content,
+    prompt: parsed.body.trim(),
+    metadata: parsed.metadata,
+    agent: normalizeAgentMetadata(normalized, parsed.metadata),
+    artifacts: [fileArtifact(normalized, info, "agent_file")],
   };
 }
 
@@ -2690,6 +3552,199 @@ function normalizePluginAgentMetadata(file, content = "", plugin = {}) {
     pluginRoot: plugin.root || path.dirname(path.dirname(file)).replace(/\\+/g, "/"),
     source: "plugin",
     metadata: parsed.metadata,
+  };
+}
+
+function normalizeAgentFrameworkMetadata(file, metadata = {}) {
+  const fallbackId = path.basename(file, path.extname(file));
+  const name = typeof metadata.name === "string" && metadata.name ? metadata.name : fallbackId;
+  const agents = parseCommaSeparatedList(metadata.agents);
+  const skills = parseCommaSeparatedList(metadata.skills);
+  const commands = parseCommaSeparatedList(metadata.commands);
+  const memories = parseCommaSeparatedList(metadata.memories);
+  const mcpServers = parseCommaSeparatedList(metadata.mcpServers);
+  const mcpTools = parseCommaSeparatedList(metadata.mcpTools);
+  const mcpResources = parseCommaSeparatedList(metadata.mcpResources);
+  const routingTerms = parseCommaSeparatedList(metadata.routingTerms);
+  const agentRoles = parseCommaSeparatedList(metadata.agentRoles);
+  const handoffs = parseCommaSeparatedList(metadata.handoffs);
+  const verificationGates = parseCommaSeparatedList(metadata.verificationGates);
+  return {
+    id: name,
+    name,
+    title: typeof metadata.title === "string" && metadata.title ? metadata.title : name,
+    description: typeof metadata.description === "string" ? metadata.description : "",
+    path: file,
+    ...(agents ? { agents } : {}),
+    ...(skills ? { skills } : {}),
+    ...(commands ? { commands } : {}),
+    ...(memories ? { memories } : {}),
+    ...(mcpServers ? { mcpServers } : {}),
+    ...(mcpTools ? { mcpTools } : {}),
+    ...(mcpResources ? { mcpResources } : {}),
+    ...(routingTerms ? { routingTerms } : {}),
+    ...(agentRoles ? { agentRoles } : {}),
+    ...(handoffs ? { handoffs } : {}),
+    ...(verificationGates ? { verificationGates } : {}),
+  };
+}
+
+function normalizeAgentFrameworkName(value, toolName = "agent_framework_write") {
+  return normalizeAgentName(value, toolName);
+}
+
+function validateAgentFrameworkWritePath(frameworkPath) {
+  const normalized = String(frameworkPath || "").replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/agent-frameworks/") || normalized.includes("../") || path.isAbsolute(normalized)) {
+    throw new Error("agent_framework_write can only write Markdown files under .oases/agent-frameworks.");
+  }
+  if (!/\.md$/i.test(normalized)) throw new Error("agent_framework_write can only write Markdown framework files.");
+  const relative = normalized.slice(".oases/agent-frameworks/".length);
+  const parts = relative.split("/");
+  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error("agent_framework_write path must stay inside .oases/agent-frameworks.");
+  }
+  normalizeAgentFrameworkName(parts.at(-1), "agent_framework_write");
+  return normalized;
+}
+
+function agentFrameworkPathFromName(name) {
+  return `.oases/agent-frameworks/${normalizeAgentFrameworkName(name, "agent_framework_write")}.md`;
+}
+
+function formatAgentFrameworkMarkdown(body = {}, normalizedPath) {
+  const name = normalizeAgentFrameworkName(body.name || path.basename(normalizedPath, path.extname(normalizedPath)), "agent_framework_write");
+  const title = String(body.title || body.heading || name).trim().replace(/\r?\n/g, " ");
+  const description = String(body.description || "").trim().replace(/\r?\n/g, " ");
+  const agents = normalizeAgentStringList(body.agents, "agents");
+  const skills = normalizeAgentStringList(body.skills, "skills");
+  const commands = normalizeAgentStringList(body.commands, "commands");
+  const memories = normalizeAgentStringList(body.memories, "memories");
+  const mcpServers = normalizeAgentStringList(body.mcpServers, "mcpServers");
+  const mcpTools = normalizeAgentStringList(body.mcpTools, "mcpTools");
+  const mcpResources = normalizeAgentStringList(body.mcpResources, "mcpResources");
+  const routingTerms = normalizeAgentStringList(body.routingTerms, "routingTerms");
+  const agentRoles = normalizeAgentStringList(body.agentRoles, "agentRoles", 100);
+  const handoffs = normalizeAgentStringList(body.handoffs, "handoffs", 100);
+  const verificationGates = normalizeAgentStringList(body.verificationGates, "verificationGates", 100);
+  const content = String(body.prompt || body.content || body.body || "").trim();
+  if (!content) throw new Error("agent_framework_write requires prompt, content, or body.");
+  const frontmatter = [
+    "---",
+    `name: ${name}`,
+    ...(title && title !== name ? [`title: ${title}`] : []),
+    ...(description ? [`description: ${description}`] : []),
+    ...formatAgentListFrontmatter("agents", agents),
+    ...formatAgentListFrontmatter("skills", skills),
+    ...formatAgentListFrontmatter("commands", commands),
+    ...formatAgentListFrontmatter("memories", memories),
+    ...formatAgentListFrontmatter("mcpServers", mcpServers),
+    ...formatAgentListFrontmatter("mcpTools", mcpTools),
+    ...formatAgentListFrontmatter("mcpResources", mcpResources),
+    ...formatAgentListFrontmatter("routingTerms", routingTerms),
+    ...formatAgentListFrontmatter("agentRoles", agentRoles),
+    ...formatAgentListFrontmatter("handoffs", handoffs),
+    ...formatAgentListFrontmatter("verificationGates", verificationGates),
+    `updatedAt: ${new Date().toISOString()}`,
+    "---",
+    "",
+  ].join("\n");
+  const bodyContent = content.startsWith("#") ? content : `# ${title || name}\n\n${content}`;
+  return `${frontmatter}${bodyContent.trimEnd()}\n`;
+}
+
+async function writeAgentFramework(root, body = {}) {
+  const normalized = body.path ? validateAgentFrameworkWritePath(body.path) : agentFrameworkPathFromName(body.name || body.title || body.heading);
+  const target = workspacePath(root, normalized);
+  if (await fileExists(target) && body.overwrite !== true) throw new Error(`Agent framework already exists: ${normalized}. Pass overwrite: true to replace it.`);
+  await mkdir(path.dirname(target), { recursive: true });
+  const content = formatAgentFrameworkMarkdown(body, normalized);
+  await writeFile(target, content, "utf8");
+  const info = await stat(target);
+  const parsed = parseMarkdownFrontmatter(content);
+  return {
+    written: true,
+    path: normalized,
+    bytes: info.size,
+    content,
+    prompt: parsed.body.trim(),
+    metadata: parsed.metadata,
+    framework: normalizeAgentFrameworkMetadata(normalized, parsed.metadata),
+    artifacts: [fileArtifact(normalized, info, "agent_framework_file")],
+  };
+}
+
+async function walkAgentFrameworkFiles(root, maxResults = 100) {
+  const frameworksRoot = path.join(root, ".oases", "agent-frameworks");
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= maxResults) return;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxResults) return;
+      if (entry.name.startsWith(".")) continue;
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\+/g, "/");
+      if (entry.isDirectory()) await visit(absolute);
+      else if (entry.isFile() && /\.md$/i.test(entry.name)) files.push(relative);
+    }
+  }
+  await visit(frameworksRoot);
+  return files;
+}
+
+async function listAgentFrameworks(root, body = {}) {
+  const maxResults = Math.max(1, Math.min(100, Number(body.maxResults) || 50));
+  const files = (await walkAgentFrameworkFiles(root, maxResults * 4))
+    .filter((file) => file.startsWith(".oases/agent-frameworks/"))
+    .slice(0, maxResults);
+  const frameworks = [];
+  for (const file of files) {
+    try {
+      const content = await readFile(path.join(root, file), "utf8");
+      const { metadata } = parseMarkdownFrontmatter(content);
+      frameworks.push(normalizeAgentFrameworkMetadata(file, metadata));
+    } catch {
+      // Ignore unreadable framework files.
+    }
+  }
+  frameworks.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+  return { frameworks, count: frameworks.length, root: ".oases/agent-frameworks", truncated: files.length >= maxResults };
+}
+
+async function readAgentFramework(root, body = {}) {
+  const requested = String(body.path || body.name || "").trim();
+  if (!requested) throw new Error("agent_framework_read requires path or name.");
+  const frameworks = await listAgentFrameworks(root, { maxResults: 100 });
+  const matched = frameworks.frameworks.find((framework) => framework.name === requested || framework.id === requested || framework.path === requested)
+    || frameworks.frameworks.find((framework) => framework.name.toLowerCase() === requested.toLowerCase());
+  const frameworkPath = matched ? matched.path : requested;
+  const normalized = frameworkPath.replace(/^\.\//, "").replace(/\\+/g, "/");
+  if (!normalized.startsWith(".oases/agent-frameworks/") || normalized.includes("../")) {
+    throw new Error("agent_framework_read can only read files under .oases/agent-frameworks.");
+  }
+  const target = workspacePath(root, normalized);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("agent_framework_read target is not a file.");
+  if (info.size > 512 * 1024) throw new Error("agent_framework_read target is too large.");
+  const content = await readFile(target, "utf8");
+  const parsed = parseMarkdownFrontmatter(content);
+  const framework = normalizeAgentFrameworkMetadata(normalized, parsed.metadata);
+  const maxChars = Math.max(1000, Math.min(120000, Number(body.maxChars) || 40000));
+  const preview = truncateText(content, maxChars);
+  const promptPreview = truncateText(parsed.body.trim(), maxChars);
+  return {
+    path: normalized,
+    bytes: info.size,
+    content: preview.text,
+    prompt: promptPreview.text,
+    truncated: preview.truncated || promptPreview.truncated,
+    framework: matched ? { ...framework, path: normalized } : framework,
   };
 }
 
@@ -3379,7 +4434,7 @@ export const TOOL_REGISTRY = {
   settings_read: {
     name: "settings_read",
     title: "Read workspace settings",
-    description: "Read a project settings file from .oases/settings.json or .oases/settings.local.json. With includeClaude, can also inspect .claude/settings.json or .claude/settings.local.json. Values are shape-only and sensitive keys are redacted.",
+    description: "Read a project settings file from .oases/settings.json or .oases/settings.local.json. With includeClaude, can also inspect .claude/settings.json or .claude/settings.local.json. Values are shape-summarized, sensitive keys are redacted, and safe non-secret settings such as memory.autoWrite, capabilityRouting limits, and contextCompaction policy are exposed under safeValues.",
     risk: "read",
     inputSchema: { type: "object", properties: { name: { type: "string" }, settings: { type: "string" }, path: { type: "string" }, includeClaude: { type: "boolean" } } },
     execute: (root, body) => readWorkspaceSettings(root, body),
@@ -3395,7 +4450,7 @@ export const TOOL_REGISTRY = {
       properties: {
         settings: {
           type: "object",
-          description: "Key/value pairs to merge into settings.local.json. Allowed top-level keys: outputStyle, mcpServers, permissions, defaultMode, todoWrite, autoContinue.",
+          description: "Key/value pairs to merge into settings.local.json. Allowed top-level keys: outputStyle, mcpServers, permissions, memory, capabilityRouting, contextCompaction, defaultMode, todoWrite, autoContinue.",
         },
         path: { type: "string", description: "Target settings path. Defaults to .oases/settings.local.json." },
       },
@@ -3412,7 +4467,7 @@ export const TOOL_REGISTRY = {
       if (!resolvedTarget.startsWith(resolvedRoot + path.sep) && resolvedTarget !== resolvedRoot) {
         throw new Error("settings_write target is outside workspace.");
       }
-      const ALLOWED_KEYS = new Set(["outputStyle", "mcpServers", "permissions", "defaultMode", "autoContinue", "todoWrite"]);
+      const ALLOWED_KEYS = new Set(["outputStyle", "mcpServers", "permissions", "memory", "capabilityRouting", "contextCompaction", "defaultMode", "autoContinue", "todoWrite"]);
       const input = body.settings;
       if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("settings_write requires a settings object.");
       const merged = {};
@@ -3428,12 +4483,33 @@ export const TOOL_REGISTRY = {
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
       }
-      const result = { ...existing, ...merged };
+      const result = { ...existing };
+      for (const [key, value] of Object.entries(merged)) {
+        result[key] = key === "mcpServers" ? mergeMcpServerSettings(existing.mcpServers, value) : value;
+      }
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, JSON.stringify(result, null, 2) + "\n", "utf8");
       const changedKeys = Object.keys(merged);
       return { path: settingsPath, changedKeys, merged: changedKeys.length, note: `Updated ${changedKeys.join(", ")} in ${settingsPath}` };
     },
+  },
+  capability_route_preview: {
+    name: "capability_route_preview",
+    title: "Preview automatic capability routing",
+    description: "Preview which skills, commands, memories, agents, agent frameworks, MCP tools, and MCP resources Ocli would likely route for a task. This is read-only: it discovers and ranks capabilities without starting an agent session or auto-calling MCP tools.",
+    risk: "read",
+    inputSchema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string", description: "Task, prompt, or capability need to route against." },
+        prompt: { type: "string" },
+        task: { type: "string" },
+        scope: { type: "string", enum: ["project", "team", "private"], description: "Optional memory scope filter for Memory RAG." },
+        capabilityRouting: { type: "object", description: "Optional routing policy override using the same shape as settings.capabilityRouting." },
+      },
+    },
+    execute: (root, body) => previewCapabilityRoute(root, body),
   },
   memory_list: {
     name: "memory_list",
@@ -3442,6 +4518,14 @@ export const TOOL_REGISTRY = {
     risk: "read",
     inputSchema: { type: "object", properties: { scope: { type: "string", enum: ["project", "team", "private"] }, maxResults: { type: "number" } } },
     execute: (root, body) => listMemories(root, body),
+  },
+  memory_search: {
+    name: "memory_search",
+    title: "Search project memories",
+    description: "Search project memory Markdown files under .oases/memory and return ranked RAG snippets plus wiki-style outgoing links and backlinks.",
+    risk: "read",
+    inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" }, q: { type: "string" }, scope: { type: "string", enum: ["project", "team", "private"] }, maxResults: { type: "number" }, maxChars: { type: "number" } } },
+    execute: (root, body) => searchMemories(root, body),
   },
   memory_read: {
     name: "memory_read",
@@ -3456,7 +4540,7 @@ export const TOOL_REGISTRY = {
     title: "Write project memory",
     description: "Create or replace a Markdown memory file under .oases/memory/<scope>. Use this only when the user explicitly asks to remember/save project guidance or when preserving durable project context is clearly useful.",
     risk: "write",
-    inputSchema: { type: "object", required: ["content"], properties: { name: { type: "string" }, title: { type: "string" }, description: { type: "string" }, content: { type: "string" }, body: { type: "string" }, scope: { type: "string", enum: ["project", "team", "private"] }, tags: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, path: { type: "string" }, overwrite: { type: "boolean" } } },
+    inputSchema: { type: "object", required: ["content"], properties: { name: { type: "string" }, title: { type: "string" }, description: { type: "string" }, content: { type: "string" }, body: { type: "string" }, scope: { type: "string", enum: ["project", "team", "private"] }, tags: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, links: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, related: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] }, path: { type: "string" }, overwrite: { type: "boolean" } } },
     execute: (root, body) => writeMemory(root, body),
   },
   skill_list: {
@@ -3739,6 +4823,87 @@ export const TOOL_REGISTRY = {
     inputSchema: { type: "object", properties: { name: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
     execute: (root, body) => readAgent(root, body),
   },
+  agent_write: {
+    name: "agent_write",
+    title: "Write workspace agent",
+    description: "Create or replace a structured workspace-local Oases agent definition under .oases/agents. Use this for reusable custom agents with tool scope, MCP tool scope, preloaded skills, commands, memories, initial prompt, effort, and optional worktree isolation.",
+    risk: "write",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Safe agent name. Defaults to the path stem when path is provided." },
+        path: { type: "string", description: "Optional target path under .oases/agents ending in .md." },
+        title: { type: "string", description: "Optional Markdown heading when prompt does not already start with #." },
+        description: { type: "string" },
+        prompt: { type: "string", description: "Agent instruction body. Also accepts content or body." },
+        content: { type: "string" },
+        body: { type: "string" },
+        agentType: { type: "string", enum: ["general", "explore", "plan", "verify"] },
+        maxTurns: { type: "number" },
+        background: { type: "boolean" },
+        isolation: { type: "string", enum: ["workspace", "worktree"] },
+        effort: { type: "string", enum: ["low", "medium", "high", "max"] },
+        tools: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        disallowedTools: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        mcpTools: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }], description: "Allowed MCP tools for mcp_call. Supports server/tool, server:*, */tool, bare tool names, or *." },
+        disallowedMcpTools: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }], description: "Denied MCP tools for mcp_call. Uses the same patterns as mcpTools and wins over mcpTools." },
+        skills: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        commands: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        memories: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        frameworks: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        initialPrompt: { type: "string" },
+        overwrite: { type: "boolean" },
+      },
+    },
+    execute: (root, body) => writeAgent(root, body),
+  },
+  agent_framework_list: {
+    name: "agent_framework_list",
+    title: "List agent frameworks",
+    description: "List reusable Oases agent frameworks under .oases/agent-frameworks. Frameworks bundle role guidance with agents, skills, commands, memories, and MCP routing hints.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { maxResults: { type: "number" } } },
+    execute: (root, body) => listAgentFrameworks(root, body),
+  },
+  agent_framework_read: {
+    name: "agent_framework_read",
+    title: "Read agent framework",
+    description: "Read a reusable Oases agent framework under .oases/agent-frameworks by framework name or relative path.",
+    risk: "read",
+    inputSchema: { type: "object", properties: { name: { type: "string" }, path: { type: "string" }, maxChars: { type: "number" } } },
+    execute: (root, body) => readAgentFramework(root, body),
+  },
+  agent_framework_write: {
+    name: "agent_framework_write",
+    title: "Write agent framework",
+    description: "Create or replace a reusable Oases agent framework under .oases/agent-frameworks. Use this to define multi-agent workflows with preloaded agents, skills, commands, memories, and MCP routing hints.",
+    risk: "write",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Safe framework name. Defaults to the path stem when path is provided." },
+        path: { type: "string", description: "Optional target path under .oases/agent-frameworks ending in .md." },
+        title: { type: "string", description: "Optional Markdown heading when content does not already start with #." },
+        description: { type: "string" },
+        prompt: { type: "string", description: "Framework instructions. Also accepts content or body." },
+        content: { type: "string" },
+        body: { type: "string" },
+        agents: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        skills: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        commands: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        memories: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        mcpServers: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        mcpTools: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        mcpResources: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        routingTerms: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+        agentRoles: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }], description: "Optional role map entries such as 'reviewer: inspect diffs and risks'." },
+        handoffs: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }], description: "Optional delegation sequence entries that tell the orchestrator when to call agent_run for named agents." },
+        verificationGates: { oneOf: [{ type: "array", items: { type: "string" } }, { type: "string" }], description: "Optional completion checks that must be satisfied before final response." },
+        overwrite: { type: "boolean" },
+      },
+    },
+    execute: (root, body) => writeAgentFramework(root, body),
+  },
   agent_run: {
     name: "agent_run",
     title: "Run sub-agent",
@@ -3751,6 +4916,8 @@ export const TOOL_REGISTRY = {
         task: { type: "string", description: "Specific subtask for the sub-agent. Include scope, expected output, and constraints." },
         description: { type: "string", description: "Short 3-5 word label for the sub-agent work." },
         agentName: { type: "string", description: "Optional workspace-local custom agent name from .oases/agents." },
+        framework: { type: "string", description: "Optional workspace-local agent framework name from .oases/agent-frameworks to preload for this sub-agent." },
+        frameworks: { type: "array", items: { type: "string" }, description: "Optional workspace-local agent framework names to preload for this sub-agent." },
         agentType: { type: "string", enum: ["general", "explore", "plan", "verify"], description: "Optional sub-agent role." },
         contextFiles: { type: "array", items: { type: "string" }, description: "Optional relative file paths the sub-agent should inspect first." },
         maxTurns: { type: "number", description: "Maximum model turns for the sub-agent, capped by ocli." },

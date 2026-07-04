@@ -65,6 +65,13 @@ export async function serve(args) {
         sendJson(response, 200, { ok: true, data: { sessions: await sessions.listAgentSessions() } }, headers);
         return;
       }
+      const resumeMatch = url.pathname.match(/^\/agent\/sessions\/([^/]+)\/resume$/);
+      if (resumeMatch && request.method === "POST") {
+        const body = await readBody(request);
+        const session = await sessions.resumeAgentSession(resumeMatch[1], body);
+        sendJson(response, 202, { ok: true, data: sessions.sessionSummary(session) }, headers);
+        return;
+      }
       const sessionMatch = url.pathname.match(/^\/agent\/sessions\/([^/]+)$/);
       if (sessionMatch && request.method === "GET") {
         const detail = await sessions.getSessionDetail(sessionMatch[1]).catch(() => undefined);
@@ -81,6 +88,7 @@ export async function serve(args) {
           artifacts: detail.artifacts,
           todos: detail.todos,
           approvalSummary: detail.approvalSummary,
+          pendingApprovals: detail.pendingApprovals,
           resumePrompt: detail.resumePrompt,
         }, headers);
         return;
@@ -119,7 +127,8 @@ export async function serve(args) {
       }
       sendJson(response, 404, { ok: false, error: "Not found." }, headers);
     } catch (error) {
-      sendJson(response, 500, { ok: false, error: error instanceof Error ? error.message : "ocli request failed." }, headers);
+      const status = typeof error?.status === "number" && error.status >= 400 && error.status < 600 ? error.status : 500;
+      sendJson(response, status, { ok: false, error: error instanceof Error ? error.message : "ocli request failed." }, headers);
     }
   });
   server.listen(args.port, "127.0.0.1", () => {

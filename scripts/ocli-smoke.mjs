@@ -111,8 +111,27 @@ async function readTextEventually(filePath) {
   throw lastError;
 }
 
+async function readJsonEventually(filePath, accept = () => true) {
+  const deadline = Date.now() + 4000;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const text = await readFile(filePath, "utf8");
+      if (text.trim()) {
+        const parsed = JSON.parse(text);
+        if (accept(parsed)) return parsed;
+        lastError = new Error(`JSON in ${filePath} did not match expected state.`);
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  throw lastError;
+}
+
 async function waitForSessionDone(sessionId) {
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 12000;
   while (Date.now() < deadline) {
     const current = await request(`/agent/sessions/${encodeURIComponent(sessionId)}`);
     const status = current.payload?.data?.status;
@@ -126,6 +145,10 @@ async function waitForApproval(sessionId) {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     const current = await request(`/agent/sessions/${encodeURIComponent(sessionId)}`);
+    const pending = Array.isArray(current.payload?.pendingApprovals)
+      ? current.payload.pendingApprovals.find((item) => item?.approvalId && item?.status !== "approved" && item?.status !== "rejected")
+      : undefined;
+    if (pending?.approvalId) return pending;
     const event = Array.isArray(current.payload?.events)
       ? current.payload.events.find((item) => item?.type === "approval_required")
       : undefined;
@@ -137,6 +160,9 @@ async function waitForApproval(sessionId) {
 
 let longMaxTurnSmokeCount = 0;
 let autoContinuationSmokeCount = 0;
+let modelRetrySmokeCount = 0;
+let modelRepairSmokeCount = 0;
+let modelEffortRepairSmokeCount = 0;
 
 const fakeApiServer = createServer(async (request, response) => {
   if (request.method === "POST" && request.url === "/v1/chat/completions") {
@@ -145,6 +171,94 @@ const fakeApiServer = createServer(async (request, response) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const text = messages.map((message) => String(message.content || "")).join("\n");
+    if (text.includes("kimi model profile smoke")) {
+      if (body.model !== "kimi-k2.6" || body.temperature !== 1 || "effort" in body || "reasoning_effort" in body) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `unexpected Kimi request profile: ${JSON.stringify({ model: body.model, temperature: body.temperature, effort: body.effort, reasoning_effort: body.reasoning_effort })}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"kimi model profile smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("gpt model profile smoke")) {
+      if (body.model !== "gpt-5.4" || body.temperature !== 1 || body.effort !== "high" || body.reasoning_effort !== "high") {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `unexpected GPT request profile: ${JSON.stringify({ model: body.model, temperature: body.temperature, effort: body.effort, reasoning_effort: body.reasoning_effort })}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"gpt model profile smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("model retry smoke")) {
+      modelRetrySmokeCount += 1;
+      if (modelRetrySmokeCount === 1) {
+        response.writeHead(500, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "transient model retry smoke outage" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"model retry smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("model repair smoke")) {
+      modelRepairSmokeCount += 1;
+      if (modelRepairSmokeCount === 1) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "invalid temperature: only 1 is allowed for this model" } }));
+        return;
+      }
+      if (body.temperature !== 1) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `temperature repair did not apply: ${String(body.temperature)}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"model repair smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("model effort repair smoke")) {
+      modelEffortRepairSmokeCount += 1;
+      if (modelEffortRepairSmokeCount === 1) {
+        if (body.effort !== "high" || body.reasoning_effort !== "high") {
+          response.writeHead(400, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ error: { message: `effort fields missing before repair: effort=${body.effort} reasoning_effort=${body.reasoning_effort}` } }));
+          return;
+        }
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "unsupported parameter: reasoning_effort is not supported by this model" } }));
+        return;
+      }
+      if ("effort" in body || "reasoning_effort" in body) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `effort repair did not remove fields: effort=${body.effort} reasoning_effort=${body.reasoning_effort}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"model effort repair smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("native tool call smoke") && !text.includes("工具执行结果")) {
       const writeFileTool = Array.isArray(body.tools)
         ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "write_file")
@@ -197,6 +311,45 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("auto reviewer routing smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
+      const agentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (!agentTool) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto-routed custom agent request did not include agent_run" } }));
+        return;
+      }
+      if (!text.includes("<agent_context") || !text.includes("reviewer-check") || !text.includes("custom reviewer marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto routing did not inject the matching custom agent context" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_auto_routed_reviewer","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"reviewer\\",\\"description\\":\\"routed-reviewer\\",\\"task\\":\\"Review src/custom-agent-target.txt and report whether the custom reviewer marker was injected.\\",\\"contextFiles\\":[\\"src/custom-agent-target.txt\\"],\\"maxTurns\\":4}"}}]}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("plugin agent delegation smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
+      const agentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (!agentTool) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "plugin agent delegation request did not include agent_run" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_plugin_agent_direct","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"plugin-explorer\\",\\"description\\":\\"plugin-agent-direct\\",\\"task\\":\\"Run plugin agent direct check.\\",\\"maxTurns\\":4}"}}]}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("limited custom agent smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
       const agentTool = Array.isArray(body.tools)
         ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
@@ -209,6 +362,40 @@ const fakeApiServer = createServer(async (request, response) => {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_limited_custom_agent","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"reader\\",\\"task\\":\\"Attempt restricted tool scope check for src/custom-agent-target.txt. First try write_file to restricted/should-not-write.txt, then report whether ocli blocked it.\\",\\"maxTurns\\":4}"}}]}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("custom agent mcp allow smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
+      const agentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (!agentTool || agentTool.function?.parameters?.properties?.agentName?.type !== "string") {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "top-level ocli agent request did not include agentName schema for MCP allow agent" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_mcp_reader_custom_agent","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"mcpreader\\",\\"task\\":\\"Run allowed MCP custom agent check.\\",\\"maxTurns\\":4}"}}]}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("custom agent mcp deny smoke") && !text.includes("子代理任务：") && !text.includes("ocli 子代理已完成")) {
+      const agentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (!agentTool || agentTool.function?.parameters?.properties?.agentName?.type !== "string") {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "top-level ocli agent request did not include agentName schema for MCP deny agent" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_mcp_blocked_custom_agent","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"mcpblocked\\",\\"task\\":\\"Run denied MCP custom agent check.\\",\\"maxTurns\\":4}"}}]}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -456,6 +643,25 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("子代理任务：Run plugin agent direct check.")) {
+      if (!text.includes("plugin direct agent marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "plugin agent prompt was not injected into sub-agent context" } }));
+        return;
+      }
+      if (!text.includes("<skill_context") || !text.includes("plugin skill auto route marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "plugin agent skill preload did not load plugin skill context" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"plugin direct agent saw plugin direct marker and plugin skill context"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("子代理任务：Attempt restricted tool scope check") && !text.includes("工具执行结果")) {
       const toolNames = Array.isArray(body.tools)
         ? body.tools.map((tool) => tool?.function?.name).filter(Boolean)
@@ -486,6 +692,50 @@ const fakeApiServer = createServer(async (request, response) => {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"limited custom agent write_file unexpectedly succeeded"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("子代理任务：Run allowed MCP custom agent check.") && !text.includes("工具执行结果")) {
+      const toolNames = Array.isArray(body.tools)
+        ? body.tools.map((tool) => tool?.function?.name).filter(Boolean)
+        : [];
+      if (!toolNames.includes("mcp_call") || toolNames.includes("read_file") || toolNames.includes("write_file") || toolNames.includes("agent_run")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `MCP allow custom agent tool schema was not scoped correctly: ${toolNames.join(",")}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"mcp_call\\",\\"arguments\\":{\\"server\\":\\"docs\\",\\"tool\\":\\"search_docs\\",\\"arguments\\":{\\"query\\":\\"custom agent mcp allow smoke\\"}}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("子代理任务：Run allowed MCP custom agent check.") && text.includes("docs result for")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"custom agent MCP allow marker observed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("子代理任务：Run denied MCP custom agent check.") && !text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"mcp_call\\",\\"arguments\\":{\\"server\\":\\"docs\\",\\"tool\\":\\"search_docs\\",\\"arguments\\":{\\"query\\":\\"custom agent mcp deny smoke\\"}}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("子代理任务：Run denied MCP custom agent check.") && text.includes("MCP tool docs/search_docs is not allowed for this sub-agent.")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"custom agent MCP deny marker observed"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -590,6 +840,24 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("auto reviewer routing smoke") && text.includes("ocli 子代理已完成 routed-reviewer") && text.includes("custom agent used custom reviewer marker")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"auto agent routing smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("plugin agent delegation smoke") && text.includes("ocli 子代理已完成 plugin-agent-direct") && text.includes("plugin direct agent saw plugin direct marker")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"plugin agent delegation smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("ocli 子代理已完成 reviewer-check") && text.includes("custom agent used custom reviewer marker")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
@@ -648,6 +916,24 @@ const fakeApiServer = createServer(async (request, response) => {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"limited custom agent smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("ocli 子代理已完成 mcp-reader-check") && text.includes("custom agent MCP allow marker observed")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"custom agent mcp allow smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("ocli 子代理已完成 mcp-blocked-check") && text.includes("custom agent MCP deny marker observed")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"custom agent mcp deny smoke completed"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -744,6 +1030,363 @@ const fakeApiServer = createServer(async (request, response) => {
       response.end("<!doctype html><html><title>Authentication Required</title><body><h1>Note to agents accessing this page:</h1><p>This page requires Vercel authentication.</p></body></html>");
       return;
     }
+    if (text.includes("delayed run check") && !text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"read_file\\",\\"arguments\\":{\\"path\\":\\"src/adaptive-trigger.txt\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("delayed run check") && text.includes("adaptive-trigger.txt") && !text.includes("auto/adaptive-routing-output.txt")) {
+      if (!text.includes("<skill_context") || !text.includes("Research Skill")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "adaptive routing did not inject the research skill context after tool output" } }));
+        return;
+      }
+      if (!text.includes("<memory_context") || !text.includes("late policy memory marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "adaptive routing did not inject the late-policy memory context after tool output" } }));
+        return;
+      }
+      if (!text.includes("<mcp_result_context") || !text.includes("docs result for")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "adaptive routing did not auto-call matching MCP after tool output" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"auto/adaptive-routing-output.txt\\",\\"content\\":\\"adaptive routing loaded late skill memory and mcp\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto/adaptive-routing-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"adaptive capability routing smoke completed\\n\\n生成文件：auto/adaptive-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("settings capability routing smoke")) {
+      if (text.includes("<skill_context") || text.includes("Research Skill")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "settings capability routing policy should have limited skill selection" } }));
+        return;
+      }
+      if (text.includes("<command_context") || text.includes("<mcp_context") || text.includes("<mcp_result_context")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "settings capability routing policy should have disabled command and MCP context" } }));
+        return;
+      }
+      if (!text.includes("<memory_context") || !text.includes("ocli smoke tests")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "settings capability routing policy should still allow one matching memory" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"settings capability routing smoke completed\\n\\npolicy limited skill command and MCP routing while preserving memory RAG"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto capability routing smoke") && !text.includes("auto-routing-output.txt")) {
+      if (!text.includes("<skill_context") || !text.includes("Research Skill")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto routing did not inject the matching skill context" } }));
+        return;
+      }
+      if (!text.includes("<command_context") || !text.includes("command context marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto routing did not inject the matching command context" } }));
+        return;
+      }
+      if (!text.includes("<memory_context") || !text.includes("ocli smoke tests")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto routing did not inject the matching memory context" } }));
+        return;
+      }
+      if (!text.includes("<mcp_context") || !text.includes("search_docs")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto routing did not inject MCP capability context" } }));
+        return;
+      }
+      if (!text.includes("<mcp_result_context") || !text.includes("docs result for")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "auto routing did not auto-call the matching read-only MCP tool" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"auto/auto-routing-output.txt\\",\\"content\\":\\"auto capability routing smoke used skill command memory mcp context and mcp result\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("plugin capability routing smoke") && !text.includes("plugin-routing-output.txt")) {
+      if (!text.includes("<skill_context") || !text.includes("Plugin Route Skill") || !text.includes("source=\"plugin\"")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "plugin auto routing did not inject plugin skill context" } }));
+        return;
+      }
+      if (!text.includes("<command_context") || !text.includes("plugin route command marker") || !text.includes("plugin=\"route-pack\"")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "plugin auto routing did not inject plugin command context" } }));
+        return;
+      }
+      if (!text.includes("<agent_context") || !text.includes("plugin route agent marker") || !text.includes("source=\"plugin\"")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "plugin auto routing did not inject plugin agent context" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"auto/plugin-routing-output.txt\\",\\"content\\":\\"plugin capability routing smoke used plugin skill command agent contexts\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("plugin-routing-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"plugin capability routing smoke completed\\n\\n生成文件：auto/plugin-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto-routing-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"auto capability routing smoke completed\\n\\n生成文件：auto/auto-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("请从这个 ocli 本地工程会话继续处理") && text.includes("failed recovery smoke")) {
+      if (
+        !text.includes("<original_session_request>")
+        || !text.includes("<session_resume_context>")
+        || !text.includes('"sourceError"')
+        || !text.includes("recoverable model outage for failed recovery smoke")
+        || !text.includes("上次错误：")
+      ) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "failed recovery resume lost source error or original request context" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"failed recovery resume completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("failed recovery smoke")) {
+      response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "recoverable model outage for failed recovery smoke" } }));
+      return;
+    }
+    if (text.includes("请从这个 ocli 本地工程会话继续处理") && text.includes("context compaction mcp evidence smoke completed")) {
+      const resumeStart = text.indexOf("<session_resume_context>");
+      const resumeEnd = text.indexOf("</session_resume_context>");
+      const snapshotStart = text.indexOf("<context_state_snapshot>");
+      const snapshotEnd = text.indexOf("</context_state_snapshot>");
+      const resumeContext = resumeStart >= 0 && resumeEnd > resumeStart
+        ? text.slice(resumeStart, resumeEnd)
+        : snapshotStart >= 0 && snapshotEnd > snapshotStart ? text.slice(snapshotStart, snapshotEnd) : "";
+      if (
+        !resumeContext.includes('"autoMemoryResults"')
+        || !resumeContext.includes('"name": "testing-policy"')
+        || !resumeContext.includes("ocli smoke tests")
+        || !resumeContext.includes('"autoMcpResults"')
+        || !resumeContext.includes('"server": "docs"')
+        || !resumeContext.includes('"tool": "search_docs"')
+        || !resumeContext.includes('"routingDiagnostics"')
+        || !resumeContext.includes('"categories"')
+        || !resumeContext.includes('"contextCompactions"')
+        || !resumeContext.includes('"stateSnapshot": true')
+      ) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `resume structured context smoke did not preserve prior evidence: ${resumeContext.slice(0, 1800)}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"resume structured context smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("请从这个 ocli 本地工程会话继续处理") && text.includes("ocli persistence smoke completed")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"resume endpoint smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("recursive resume snapshot smoke")) {
+      const snapshotStart = text.indexOf("<context_state_snapshot>");
+      const snapshotEnd = text.indexOf("</context_state_snapshot>");
+      const snapshot = snapshotStart >= 0 && snapshotEnd > snapshotStart ? text.slice(snapshotStart, snapshotEnd) : "";
+      if (
+        !text.includes("<context_compaction")
+        || !snapshot.includes('"sessionResumeContext"')
+        || !snapshot.includes('"sourceSessionId": "sess_recursive_source"')
+        || !snapshot.includes('"autoMemoryResults"')
+        || !snapshot.includes('"name": "testing-policy"')
+        || !snapshot.includes("ocli smoke tests")
+        || !snapshot.includes('"autoMcpResults"')
+        || !snapshot.includes('"server": "docs"')
+        || !snapshot.includes('"tool": "search_docs"')
+        || !snapshot.includes('"routingDiagnostics"')
+        || !snapshot.includes('"categories"')
+        || !snapshot.includes('"contextCompactions"')
+        || !snapshot.includes('"stateSnapshot": true')
+      ) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `recursive resume snapshot smoke lost nested resume evidence: ${snapshot.slice(0, 1800)}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"recursive resume context compaction smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("agent framework routing smoke") && !text.includes("framework-routing-output.txt")) {
+      if (!text.includes("<agent_framework_context") || !text.includes("framework routing marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "agent framework routing did not inject framework context" } }));
+        return;
+      }
+      if (!text.includes("<skill_context") || !text.includes("Research Skill")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "agent framework routing did not preload framework skill dependencies" } }));
+        return;
+      }
+      if (!text.includes("<memory_context") || !text.includes("ocli smoke tests")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "agent framework routing did not preload framework memory dependencies" } }));
+        return;
+      }
+      if (!text.includes("<agent_context") || !text.includes("custom reviewer marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "agent framework routing did not preload framework agent dependencies" } }));
+        return;
+      }
+      if (!text.includes("<mcp_context") || !text.includes("search_docs") || !text.includes("docs://routing-guide")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "agent framework routing did not preload framework MCP dependencies" } }));
+        return;
+      }
+      if (!text.includes("<framework_execution_blueprint>") || !text.includes("orchestrator -> reviewer") || !text.includes("final response cites generated artifact path")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "agent framework routing did not inject framework execution blueprint" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"auto/framework-routing-output.txt\\",\\"content\\":\\"agent framework routing smoke used framework skill memory agent mcp resource contexts\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("<framework_blueprint_guard>") && text.includes("agent framework routing smoke") && !text.includes("ocli 子代理已完成 framework-reviewer")) {
+      const agentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (!agentTool) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "framework blueprint guard request did not include agent_run" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_framework_reviewer","type":"function","function":{"name":"agent_run","arguments":"{\\"agentName\\":\\"reviewer\\",\\"description\\":\\"framework-reviewer\\",\\"task\\":\\"Review auto/framework-routing-output.txt and report whether the generated artifact path satisfies the research-stack framework verification gates.\\",\\"contextFiles\\":[\\"auto/framework-routing-output.txt\\"],\\"maxTurns\\":4}"}}]}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("子代理任务：按 Framework research-stack 的蓝图检查当前实现")) {
+      const nestedAgentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (nestedAgentTool) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "automatic framework reviewer sub-agent request should not include agent_run" } }));
+        return;
+      }
+      if (!text.includes("custom reviewer marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "automatic framework reviewer custom agent prompt was not injected" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"framework reviewer confirmed generated artifact path and verification gates for auto/framework-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("子代理任务：Review auto/framework-routing-output.txt")) {
+      const nestedAgentTool = Array.isArray(body.tools)
+        ? body.tools.find((tool) => tool?.type === "function" && tool?.function?.name === "agent_run")
+        : undefined;
+      if (nestedAgentTool) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "framework reviewer sub-agent request should not include agent_run" } }));
+        return;
+      }
+      if (!text.includes("custom reviewer marker")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "framework reviewer custom agent prompt was not injected" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"framework reviewer confirmed generated artifact path and verification gates for auto/framework-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("ocli 子代理已完成 framework-reviewer") && text.includes("framework reviewer confirmed generated artifact path")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"agent framework routing smoke completed\\n\\nreviewer handoff satisfied; verification gate cites generated artifact path auto/framework-routing-output.txt\\n\\n生成文件：auto/framework-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("framework-routing-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"agent framework routing smoke completed\\n\\n生成文件：auto/framework-routing-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("skill guided smoke") && !text.includes("ocli 已列出工作区技能")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
@@ -829,6 +1472,78 @@ const fakeApiServer = createServer(async (request, response) => {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
         'data: {"choices":[{"delta":{"content":"preloaded command smoke completed\\n\\n生成文件：commands/preloaded-command-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto memory suggestion smoke") && !text.includes("auto-memory-suggestion-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"memory/auto-memory-suggestion-output.txt\\",\\"content\\":\\"auto memory suggestion smoke wrote an artifact\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto memory clean request smoke") && !text.includes("auto-memory-clean-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"memory/auto-memory-clean-output.txt\\",\\"content\\":\\"auto memory clean request smoke wrote an artifact\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto memory open todo smoke") && !text.includes("open-memory-follow-up")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"todo_write\\",\\"arguments\\":{\\"todos\\":[{\\"id\\":\\"open-memory-follow-up\\",\\"text\\":\\"open-memory-follow-up\\",\\"status\\":\\"doing\\"}]}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto memory open todo smoke") && text.includes("open-memory-follow-up")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"auto memory open todo smoke still has unfinished work."}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto-memory-clean-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"auto memory clean request smoke completed\\n\\n生成文件：memory/auto-memory-clean-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto-memory-suggestion-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"auto memory suggestion smoke completed\\n\\n生成文件：memory/auto-memory-suggestion-output.txt"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto memory write smoke") && !text.includes("auto-memory-write-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"memory/auto-memory-write-output.txt\\",\\"content\\":\\"auto memory write smoke wrote an artifact\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("auto-memory-write-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"auto memory write smoke completed\\n\\n生成文件：memory/auto-memory-write-output.txt"}}]}',
         "data: [DONE]",
         "",
       ].join("\n\n"));
@@ -1070,6 +1785,263 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("completion guard todo smoke") && !text.includes("ocli 自动续跑") && !text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"任务未完成，剩余 todo：完成验证和收尾。"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("completion guard todo smoke") && text.includes("续跑原因：open_todo") && !text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"guard/todo-output.txt\\",\\"content\\":\\"completion guard todo smoke ok\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("guard/todo-output.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"completion guard todo smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("post tool continuation smoke") && !text.includes("post-tool-output.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"我会写入文件，之后还需要运行验证。\\n<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"guard/post-tool-output.txt\\",\\"content\\":\\"post tool continuation file\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("post-tool-output.txt") && text.includes("工具执行结果") && !text.includes("续跑原因：promised_follow_up")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"post tool continuation smoke stopped too early"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("post-tool-output.txt") && text.includes("续跑原因：promised_follow_up") && !text.includes("post-tool-verified.txt")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"write_file\\",\\"arguments\\":{\\"path\\":\\"guard/post-tool-verified.txt\\",\\"content\\":\\"post tool continuation verified\\"}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("post-tool-verified.txt") && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"post tool continuation smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("persistent todo restore smoke") && text.includes("persisted follow-up") && text.includes('"status": "done"') && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"persistent todo restore smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("persistent todo restore smoke") && text.includes("续跑原因：open_todo_state")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"todo_write\\",\\"arguments\\":{\\"todos\\":[{\\"text\\":\\"persisted follow-up\\",\\"status\\":\\"done\\"}]}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("persistent todo restore smoke")) {
+      if (!text.includes("<todo_state_context>") || !text.includes("persisted follow-up")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "persistent todo restore smoke request did not include restored todo context" } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"persistent todo restore smoke completed too early"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("todo state guard smoke") && text.includes("state guard follow-up") && text.includes('"status": "done"') && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"todo state guard smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("todo state guard smoke") && text.includes("续跑原因：open_todo_state")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"todo_write\\",\\"arguments\\":{\\"todos\\":[{\\"text\\":\\"state guard follow-up\\",\\"status\\":\\"done\\"}]}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("todo state guard smoke") && text.includes("ocli 已更新任务计划") && !text.includes("续跑原因：open_todo_state")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"todo state guard smoke completed too early"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("todo state guard smoke")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"todo_write\\",\\"arguments\\":{\\"todos\\":[{\\"text\\":\\"state guard follow-up\\",\\"status\\":\\"doing\\"}]}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("context compaction adaptive tail smoke")) {
+      const retainedMatch = text.match(/<context_compaction\b[^>]*requestedRetainedMessages="(\d+)"[^>]*retainedMessages="(\d+)"/);
+      const requestedRetained = Number(retainedMatch?.[1]);
+      const retained = Number(retainedMatch?.[2]);
+      if (!text.includes("<context_compaction") || requestedRetained !== 8 || !(retained > 0 && retained < requestedRetained)) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `adaptive tail compaction smoke did not shrink retained tail: ${JSON.stringify({ requestedRetained, retained, excerpt: text.slice(text.indexOf("<context_compaction"), text.indexOf("</context_compaction>") + "</context_compaction>".length).slice(0, 900) })}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"context compaction adaptive tail smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("context compaction todo state smoke") && text.includes("compaction restored todo") && text.includes('"status": "done"') && text.includes("工具执行结果")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"context compaction todo state smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("context compaction todo state smoke") && text.includes("续跑原因：open_todo_state")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"<tool>{\\"name\\":\\"todo_write\\",\\"arguments\\":{\\"todos\\":[{\\"text\\":\\"compaction restored todo\\",\\"status\\":\\"done\\"}]}}</tool>"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("context compaction todo state smoke")) {
+      const snapshotStart = text.indexOf("<context_state_snapshot>");
+      const snapshotEnd = text.indexOf("</context_state_snapshot>");
+      const snapshot = snapshotStart >= 0 && snapshotEnd > snapshotStart ? text.slice(snapshotStart, snapshotEnd) : "";
+      if (!text.includes("<context_compaction") || !snapshot.includes('"openTodos"') || !snapshot.includes("compaction restored todo") || !snapshot.includes('"status": "doing"')) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `context compaction todo state smoke did not preserve open todos: ${snapshot.slice(0, 1200)}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"context compaction todo state smoke completed too early"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("请从这个 ocli 本地工程会话继续处理") && text.includes("context compaction mcp evidence smoke completed")) {
+      const resumeStart = text.indexOf("<session_resume_context>");
+      const resumeEnd = text.indexOf("</session_resume_context>");
+      const snapshotStart = text.indexOf("<context_state_snapshot>");
+      const snapshotEnd = text.indexOf("</context_state_snapshot>");
+      const resumeContext = resumeStart >= 0 && resumeEnd > resumeStart
+        ? text.slice(resumeStart, resumeEnd)
+        : snapshotStart >= 0 && snapshotEnd > snapshotStart ? text.slice(snapshotStart, snapshotEnd) : "";
+      if (
+        !resumeContext.includes('"autoMemoryResults"')
+        || !resumeContext.includes('"name": "testing-policy"')
+        || !resumeContext.includes("ocli smoke tests")
+        || !resumeContext.includes('"autoMcpResults"')
+        || !resumeContext.includes('"server": "docs"')
+        || !resumeContext.includes('"tool": "search_docs"')
+        || !resumeContext.includes('"routingDiagnostics"')
+        || !resumeContext.includes('"categories"')
+        || !resumeContext.includes('"contextCompactions"')
+        || !resumeContext.includes('"stateSnapshot": true')
+      ) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `resume structured context smoke did not preserve prior evidence: ${resumeContext.slice(0, 1800)}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"resume structured context smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
+    if (text.includes("context compaction smoke")) {
+      if (!text.includes("<context_compaction") || !text.includes("compaction-history-marker-0")) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "context compaction smoke request did not include compacted history summary" } }));
+        return;
+      }
+      const expectsMcpSnapshot = text.includes("context compaction smoke with mcp evidence");
+      const hasStateSnapshot = text.includes("<context_state_snapshot>");
+      const hasCurrentTask = expectsMcpSnapshot
+        ? text.includes('"currentTask": "context compaction smoke with mcp evidence: use docs MCP search_docs capability and testing-policy memory."')
+        : text.includes('"currentTask": "context compaction smoke"');
+      const hasActiveCapabilities = text.includes('"activeCapabilities"');
+      if (!hasStateSnapshot || !hasCurrentTask || !hasActiveCapabilities) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `context compaction smoke request did not include resumable state snapshot: ${JSON.stringify({ hasStateSnapshot, hasCurrentTask, hasActiveCapabilities, excerpt: text.slice(text.indexOf("<context_compaction"), text.indexOf("</context_compaction>") + "</context_compaction>".length).slice(0, 900) })}` } }));
+        return;
+      }
+      if (expectsMcpSnapshot && (!text.includes('"autoMcpResults"') || !text.includes('"server": "docs"') || !text.includes('"tool": "search_docs"') || !text.includes("docs result for"))) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `context compaction smoke request did not preserve auto MCP result evidence: ${text.slice(text.indexOf("<context_state_snapshot>"), text.indexOf("</context_state_snapshot>") + "</context_state_snapshot>".length).slice(0, 1200)}` } }));
+        return;
+      }
+      if (expectsMcpSnapshot && (!text.includes('"autoMemoryResults"') || !text.includes('"name": "testing-policy"') || !text.includes("ocli smoke tests"))) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `context compaction smoke request did not preserve auto memory RAG evidence: ${text.slice(text.indexOf("<context_state_snapshot>"), text.indexOf("</context_state_snapshot>") + "</context_state_snapshot>".length).slice(0, 1200)}` } }));
+        return;
+      }
+      if (expectsMcpSnapshot && (!text.includes('"routingDiagnostics"') || !text.includes('"queryTerms"') || !text.includes('"mcpTools"'))) {
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `context compaction smoke request did not preserve routing diagnostics: ${text.slice(text.indexOf("<context_state_snapshot>"), text.indexOf("</context_state_snapshot>") + "</context_state_snapshot>".length).slice(0, 1200)}` } }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        expectsMcpSnapshot
+          ? 'data: {"choices":[{"delta":{"content":"context compaction mcp evidence smoke completed"}}]}'
+          : 'data: {"choices":[{"delta":{"content":"context compaction smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     if (text.includes("crawler artifact smoke") && !text.includes("Fetch source page")) {
       response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
       response.end([
@@ -1135,6 +2107,15 @@ const fakeApiServer = createServer(async (request, response) => {
       ].join("\n\n"));
       return;
     }
+    if (text.includes("请从这个 ocli 本地工程会话继续处理") && text.includes("ocli persistence smoke completed")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      response.end([
+        'data: {"choices":[{"delta":{"content":"resume endpoint smoke completed"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n"));
+      return;
+    }
     response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
     response.end([
       'data: {"choices":[{"delta":{"content":"ocli persistence smoke completed"}}]}',
@@ -1178,7 +2159,7 @@ try {
   assert(health.payload?.modelSource === "web", "/health should declare web-owned model source");
   assert(health.payload?.apiSource === "web-proxy", "/health should declare web proxy API source");
   assert(Array.isArray(health.payload?.toolCapabilities), "/health should expose tool capabilities");
-  const runtimeInfo = JSON.parse(await readTextEventually(path.join(workspace, ".oases", "ocli", "runtime.json")));
+  const runtimeInfo = await readJsonEventually(path.join(workspace, ".oases", "ocli", "runtime.json"));
   assert(runtimeInfo.token === smokeToken && runtimeInfo.port === port, "ocli should persist current runtime token and port for ocli open");
   assert(String(runtimeInfo.webUrl || "").includes(`ocliToken=${smokeToken}`), "runtime info should include tokenized web URL");
   const openDryRun = await runLocal(process.execPath, ["index.js", "open", "--workspace", workspace, "--dry-run"], path.resolve(import.meta.dirname, ".."));
@@ -1197,6 +2178,7 @@ try {
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "settings_list" && tool.risk === "read"), "/tools should expose settings_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "settings_read" && tool.risk === "read"), "/tools should expose settings_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_list" && tool.risk === "read"), "/tools should expose memory_list metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_search" && tool.risk === "read"), "/tools should expose memory_search metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_read" && tool.risk === "read"), "/tools should expose memory_read metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "memory_write" && tool.risk === "write"), "/tools should expose memory_write metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "skill_list" && tool.risk === "read"), "/tools should expose skill_list metadata");
@@ -1234,6 +2216,8 @@ try {
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "plugin_disable" && tool.risk === "write"), "/tools should expose plugin_disable metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_list" && tool.risk === "read"), "/tools should expose agent_list metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_read" && tool.risk === "read"), "/tools should expose agent_read metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_write" && tool.risk === "write"), "/tools should expose agent_write metadata");
+  assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_write" && tool.inputSchema?.properties?.isolation?.enum?.includes("worktree")), "/tools should expose agent_write worktree isolation metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_run" && tool.risk === "agent"), "/tools should expose agent_run metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_run" && tool.inputSchema?.properties?.isolation?.enum?.includes("worktree")), "/tools should expose agent_run worktree isolation metadata");
   assert(tools.payload?.data?.tools?.some((tool) => tool.name === "agent_run" && tool.inputSchema?.properties?.agentName?.type === "string"), "/tools should expose agent_run agentName metadata");
@@ -1255,7 +2239,47 @@ try {
   await request("/tools/write_file", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: ".oases/settings.json", content: JSON.stringify({ outputStyle: "concise-local", env: { OASES_API_KEY: "workspace-secret" }, permissions: { allow: ["read_file"], deny: ["Write(denied-by-settings.txt)"], ask: ["Write(ask-by-settings.txt)"] } }, null, 2) }),
+    body: JSON.stringify({
+      path: ".oases/mcp/docs-server.mjs",
+      content: [
+        "const responses = {",
+        "  initialize: { protocolVersion: '2024-11-05', capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'docs', version: '1.0.0' } },",
+        "  'tools/list': { tools: [{ name: 'search_docs', description: 'Search workspace docs for routing smoke tests.', inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] } }] },",
+        "  'resources/list': { resources: [{ uri: 'docs://routing-guide', name: 'Routing Guide', description: 'Auto routing smoke MCP resource', mimeType: 'text/markdown' }] },",
+        "};",
+        "let buffer = Buffer.alloc(0);",
+        "function send(id, result) {",
+        "  const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id, result }), 'utf8');",
+        "  process.stdout.write(`Content-Length: ${body.length}\\r\\n\\r\\n`);",
+        "  process.stdout.write(body);",
+        "}",
+        "process.stdin.on('data', (chunk) => {",
+        "  buffer = Buffer.concat([buffer, chunk]);",
+        "  while (true) {",
+        "    const headerEnd = buffer.indexOf('\\r\\n\\r\\n');",
+        "    if (headerEnd === -1) return;",
+        "    const header = buffer.slice(0, headerEnd).toString('utf8');",
+        "    const match = header.match(/Content-Length:\\s*(\\d+)/i);",
+        "    if (!match) { buffer = buffer.slice(headerEnd + 4); continue; }",
+        "    const length = Number(match[1]);",
+        "    const start = headerEnd + 4;",
+        "    if (buffer.length < start + length) return;",
+        "    const message = JSON.parse(buffer.slice(start, start + length).toString('utf8'));",
+        "    buffer = buffer.slice(start + length);",
+        "    if (message.id === undefined) continue;",
+        "    if (message.method === 'tools/call') send(message.id, { content: [{ type: 'text', text: `docs result for ${message.params?.arguments?.query || ''}` }] });",
+        "    else if (message.method === 'resources/read') send(message.id, { contents: [{ uri: message.params?.uri, mimeType: 'text/markdown', text: '# Routing Guide\\n\\nMCP routing resource.' }] });",
+        "    else send(message.id, responses[message.method] || {});",
+        "  }",
+        "});",
+      ].join("\n"),
+    }),
+  });
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.json", content: JSON.stringify({ outputStyle: "concise-local", env: { OASES_API_KEY: "workspace-secret" }, permissions: { allow: ["read_file"], deny: ["Write(denied-by-settings.txt)"], ask: ["Write(ask-by-settings.txt)"] }, mcpServers: { docs: { command: process.execPath, args: [path.join(workspace, ".oases", "mcp", "docs-server.mjs")], env: { DOCS_TOKEN: "mcp-secret" } } } }, null, 2) }),
   });
   await request("/tools/write_file", {
     method: "POST",
@@ -1276,7 +2300,11 @@ try {
   });
   assert(settingsRead.payload?.data?.settings?.keys?.includes("outputStyle"), "settings_read should summarize workspace settings keys");
   assert(settingsRead.payload?.data?.settings?.values?.env?.values?.OASES_API_KEY?.redacted === true, "settings_read should redact sensitive nested keys");
+  assert(settingsRead.payload?.data?.safeValues?.mcpServers?.servers?.docs?.command === process.execPath, "settings_read should expose safe MCP server command metadata");
+  assert(settingsRead.payload?.data?.safeValues?.mcpServers?.servers?.docs?.args?.length === 1, "settings_read should expose safe MCP server args metadata");
+  assert(settingsRead.payload?.data?.safeValues?.mcpServers?.servers?.docs?.envKeys?.includes("DOCS_TOKEN"), "settings_read should expose MCP server env key names only");
   assert(!JSON.stringify(settingsRead.payload?.data || {}).includes("workspace-secret"), "settings_read should not expose sensitive workspace setting values");
+  assert(!JSON.stringify(settingsRead.payload?.data || {}).includes("mcp-secret"), "settings_read should not expose sensitive MCP env values");
   const claudeSettingsReadBlocked = await request("/tools/settings_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1300,12 +2328,56 @@ try {
       title: "Testing policy",
       description: "How this workspace validates changes",
       tags: ["testing", "policy"],
+      links: ["review-flow"],
       content: "Integration-level changes should run the ocli smoke tests before release.",
     }),
   });
   assert(memoryWrite.payload?.ok === true, "memory_write should create project memory");
   assert(memoryWrite.payload?.data?.path === ".oases/memory/project/testing-policy.md", "memory_write should write under the scoped memory directory");
   assert(memoryWrite.payload?.data?.artifacts?.[0]?.role === "memory_file", "memory_write should return a memory artifact");
+  assert(memoryWrite.payload?.data?.memory?.links?.includes("review-flow"), "memory_write should persist wiki-style memory links");
+  const linkedMemoryWrite = await request("/tools/memory_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      scope: "project",
+      name: "release-checklist",
+      title: "Release checklist",
+      description: "Release checks linked to the testing policy",
+      tags: ["release"],
+      links: ["project:testing-policy"],
+      content: "Release checklist references [[testing-policy]] before shipping production builds.",
+    }),
+  });
+  assert(linkedMemoryWrite.payload?.ok === true, "memory_write should create linked project memory");
+  const autoLinkedMemoryWrite = await request("/tools/memory_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      scope: "project",
+      name: "deployment-rule",
+      title: "Deployment rule",
+      tags: ["release"],
+      content: "Deployment review must follow testing-policy before production updates.",
+    }),
+  });
+  assert(autoLinkedMemoryWrite.payload?.ok === true, "memory_write should create auto-linked project memory");
+  assert(autoLinkedMemoryWrite.payload?.data?.autoLinks?.includes("project:testing-policy"), "memory_write should infer wiki links to existing memories mentioned in content");
+  assert(autoLinkedMemoryWrite.payload?.data?.memory?.links?.includes("project:testing-policy"), "memory_write should persist inferred wiki links");
+  const latePolicyMemoryWrite = await request("/tools/memory_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      scope: "project",
+      name: "late-policy",
+      title: "Late policy",
+      description: "Loaded only after tool output asks for it",
+      tags: ["adaptive", "routing"],
+      links: ["testing-policy"],
+      content: "late policy memory marker: adaptive routing should load this only after a tool result mentions late-policy.",
+    }),
+  });
+  assert(latePolicyMemoryWrite.payload?.ok === true, "memory_write should create late adaptive routing memory");
   const memoryList = await request("/tools/memory_list", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1318,6 +2390,17 @@ try {
     body: JSON.stringify({ name: "testing-policy", scope: "project" }),
   });
   assert(memoryRead.payload?.data?.body?.includes("ocli smoke tests"), "memory_read should read memory body text");
+  assert(memoryRead.payload?.data?.memory?.links?.includes("review-flow"), "memory_read should expose memory links");
+  const memorySearch = await request("/tools/memory_search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "integration release smoke tests", scope: "project", maxResults: 5, maxChars: 240 }),
+  });
+  const searchedTestingPolicy = memorySearch.payload?.data?.memories?.find((memory) => memory?.memory?.name === "testing-policy");
+  assert(searchedTestingPolicy?.snippet?.includes("ocli smoke tests"), "memory_search should return RAG snippets from matching memory body");
+  assert(searchedTestingPolicy?.links?.includes("review-flow"), "memory_search should return outgoing memory links");
+  assert(searchedTestingPolicy?.backlinks?.some((link) => link?.name === "release-checklist"), "memory_search should return backlinks from wiki-style linked memories");
+  assert(searchedTestingPolicy?.backlinks?.some((link) => link?.name === "deployment-rule"), "memory_search should return backlinks from auto-linked memories");
   const duplicateMemoryWrite = await request("/tools/memory_write", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1537,6 +2620,36 @@ try {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: ".oases/plugins/feature-dev/settings.json", content: JSON.stringify({ safeMode: true, apiToken: "should-not-leak", nested: { password: "should-not-leak" } }, null, 2) }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: ".oases/plugins/route-pack/.claude-plugin/plugin.json",
+      content: JSON.stringify({
+        name: "route-pack",
+        version: "1.0.0",
+        description: "Plugin-only routing fixture",
+        commandsPaths: ["./commands"],
+        agentsPaths: ["./agents"],
+        skillsPaths: ["./skills"],
+      }, null, 2),
+    }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/route-pack/commands/plugin-route-flow.md", content: "---\ndescription: Plugin route command fixture\n---\n\n# Plugin Route Flow\n\nplugin route command marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/route-pack/agents/plugin-explorer.md", content: "---\nname: plugin-explorer\ndescription: Plugin route agent fixture\nagentType: explore\ntools:\n  - read_file\nskills:\n  - plugin-route-helper\nmaxTurns: 4\n---\n\n# Plugin Explorer Agent\n\nplugin route agent marker\nplugin direct agent marker\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/plugins/route-pack/skills/plugin-route-helper/SKILL.md", content: "---\nname: plugin-route-helper\ndescription: Plugin route helper skill\n---\n\n# Plugin Route Skill\n\nplugin skill auto route marker\n" }),
   });
   const pluginList = await request("/tools/plugin_list", {
     method: "POST",
@@ -2057,10 +3170,117 @@ try {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: ".oases/agents/effortful.md", content: "---\nname: effortful\ndescription: effort-check\nagentType: verify\neffort: low\n---\n\n# Effortful Agent\n\nUse the configured effort level for this sub-agent.\n" }),
   });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/agents/mcpreader.md", content: "---\nname: mcpreader\ndescription: mcp-reader-check\nagentType: verify\ntools: mcp_call\nmcpTools: docs/search_docs\n---\n\n# MCP Reader Agent\n\nOnly call the approved docs/search_docs MCP tool.\n" }),
+  });
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/agents/mcpblocked.md", content: "---\nname: mcpblocked\ndescription: mcp-blocked-check\nagentType: verify\ntools: mcp_call\ndisallowedMcpTools: docs/search_docs\n---\n\n# MCP Blocked Agent\n\nTry the denied docs/search_docs MCP tool so the runtime proves enforcement.\n" }),
+  });
+  const agentWrite = await request("/tools/agent_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: "maintainer",
+      title: "Maintainer Agent",
+      description: "maintainer-check",
+      agentType: "plan",
+      maxTurns: 5,
+      background: true,
+      isolation: "worktree",
+      effort: "medium",
+      tools: ["read_file", "grep_files", "workspace_status", "agent_status"],
+      disallowedTools: "delete_file",
+      mcpTools: ["docs/search_docs"],
+      disallowedMcpTools: "payments/send_money",
+      skills: ["research"],
+      commands: ["review-flow"],
+      memories: ["project:testing-policy"],
+      initialPrompt: "maintainer initial marker\nsecond maintainer line",
+      prompt: "Use project context to plan safe maintenance work.\n\nmaintainer prompt marker",
+    }),
+  });
+  assert(agentWrite.payload?.ok === true, "agent_write should create structured custom agents");
+  assert(agentWrite.payload?.data?.path === ".oases/agents/maintainer.md", "agent_write should write under .oases/agents");
+  assert(agentWrite.payload?.data?.artifacts?.[0]?.role === "agent_file", "agent_write should return an agent artifact");
+  assert(agentWrite.payload?.data?.agent?.agentType === "plan", "agent_write should return parsed agent metadata");
+  assert(agentWrite.payload?.data?.agent?.tools?.includes("workspace_status"), "agent_write should persist tool allowlist metadata");
+  assert(agentWrite.payload?.data?.agent?.disallowedTools?.includes("delete_file"), "agent_write should persist disallowed tool metadata");
+  assert(agentWrite.payload?.data?.agent?.mcpTools?.includes("docs/search_docs"), "agent_write should persist MCP allowlist metadata");
+  assert(agentWrite.payload?.data?.agent?.disallowedMcpTools?.includes("payments/send_money"), "agent_write should persist MCP denylist metadata");
+  assert(String(agentWrite.payload?.data?.prompt || "").includes("maintainer prompt marker"), "agent_write should return the written prompt body");
+  const duplicateAgentWrite = await request("/tools/agent_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "maintainer", prompt: "duplicate" }),
+  });
+  assert(duplicateAgentWrite.response.status >= 400, "agent_write should refuse to overwrite by default");
+  const invalidAgentWrite = await request("/tools/agent_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "../maintainer.md", prompt: "invalid" }),
+  });
+  assert(invalidAgentWrite.response.status >= 400, "agent_write should reject paths outside .oases/agents");
+  const unknownToolAgentWrite = await request("/tools/agent_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "bad-tools", tools: ["not_a_tool"], prompt: "invalid tools" }),
+  });
+  assert(unknownToolAgentWrite.response.status >= 400, "agent_write should reject unknown tool names");
+  const agentFrameworkWrite = await request("/tools/agent_framework_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: "research-stack",
+      title: "Research Stack",
+      description: "research stack framework marker",
+      agents: ["reviewer"],
+      skills: ["research"],
+      commands: ["review-flow"],
+      memories: ["project:testing-policy"],
+      mcpTools: ["docs/search_docs"],
+      mcpResources: ["docs://routing-guide"],
+      agentRoles: ["reviewer: inspect project risks and call agent_run before final verification", "implementer: make scoped file changes only after context is loaded"],
+      handoffs: ["orchestrator -> reviewer before final response", "reviewer -> orchestrator with risk findings"],
+      verificationGates: ["all framework MCP/resource evidence reviewed", "final response cites generated artifact path"],
+      routingTerms: ["agent framework routing smoke", "research stack"],
+      prompt: "Use this framework when the task asks for the research-stack workflow.\n\nframework routing marker",
+    }),
+  });
+  assert(agentFrameworkWrite.payload?.ok === true, "agent_framework_write should create structured frameworks");
+  assert(agentFrameworkWrite.payload?.data?.path === ".oases/agent-frameworks/research-stack.md", "agent_framework_write should write under .oases/agent-frameworks");
+  assert(agentFrameworkWrite.payload?.data?.artifacts?.[0]?.role === "agent_framework_file", "agent_framework_write should return a framework artifact");
+  assert(agentFrameworkWrite.payload?.data?.framework?.skills?.includes("research"), "agent_framework_write should persist skill dependencies");
+  assert(agentFrameworkWrite.payload?.data?.framework?.memories?.includes("project:testing-policy"), "agent_framework_write should persist memory dependencies");
+  assert(agentFrameworkWrite.payload?.data?.framework?.mcpTools?.includes("docs/search_docs"), "agent_framework_write should persist MCP tool dependencies");
+  assert(agentFrameworkWrite.payload?.data?.framework?.mcpResources?.includes("docs://routing-guide"), "agent_framework_write should persist MCP resource dependencies");
+  assert(agentFrameworkWrite.payload?.data?.framework?.agentRoles?.some((item) => item.includes("reviewer:")), "agent_framework_write should persist agent role blueprint entries");
+  assert(agentFrameworkWrite.payload?.data?.framework?.handoffs?.some((item) => item.includes("orchestrator -> reviewer")), "agent_framework_write should persist handoff blueprint entries");
+  assert(agentFrameworkWrite.payload?.data?.framework?.verificationGates?.some((item) => item.includes("artifact path")), "agent_framework_write should persist verification gates");
+  const agentFrameworkList = await request("/tools/agent_framework_list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxResults: 12 }),
+  });
+  assert(agentFrameworkList.payload?.data?.frameworks?.some((framework) => framework?.name === "research-stack" && framework?.agents?.includes("reviewer") && framework?.mcpResources?.includes("docs://routing-guide")), "agent_framework_list should discover workspace-local frameworks");
+  assert(agentFrameworkList.payload?.data?.frameworks?.some((framework) => framework?.name === "research-stack" && framework?.agentRoles?.some((item) => item.includes("implementer:"))), "agent_framework_list should expose framework agent roles");
+  const agentFrameworkRead = await request("/tools/agent_framework_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "research-stack" }),
+  });
+  assert(agentFrameworkRead.payload?.data?.content?.includes("framework routing marker"), "agent_framework_read should read framework content by name");
+  assert(agentFrameworkRead.payload?.data?.framework?.commands?.includes("review-flow"), "agent_framework_read should expose command dependencies");
+  assert(agentFrameworkRead.payload?.data?.framework?.mcpTools?.includes("docs/search_docs"), "agent_framework_read should expose MCP tool dependencies");
+  assert(agentFrameworkRead.payload?.data?.framework?.mcpResources?.includes("docs://routing-guide"), "agent_framework_read should expose MCP resource dependencies");
+  assert(agentFrameworkRead.payload?.data?.framework?.handoffs?.some((item) => item.includes("reviewer -> orchestrator")), "agent_framework_read should expose handoff blueprint entries");
   const agentList = await request("/tools/agent_list", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ maxResults: 10 }),
+    body: JSON.stringify({ maxResults: 12 }),
   });
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "reviewer" && agent?.path === ".oases/agents/reviewer.md"), "agent_list should discover workspace-local agents");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "reader" && agent?.tools?.includes("read_file")), "agent_list should expose custom agent tool metadata");
@@ -2069,6 +3289,9 @@ try {
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "starter" && agent?.initialPrompt === "initial prompt marker"), "agent_list should expose custom agent initialPrompt metadata");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "yamlstarter" && agent?.tools?.includes("read_file") && agent?.disallowedTools?.includes("write_file") && agent?.skills?.includes("research") && String(agent?.initialPrompt || "").includes("second seeded line")), "agent_list should expose YAML list and block scalar custom agent metadata");
   assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "effortful" && agent?.effort === "low"), "agent_list should expose custom agent effort metadata");
+  assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "mcpreader" && agent?.mcpTools?.includes("docs/search_docs")), "agent_list should expose custom agent MCP allowlist metadata");
+  assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "mcpblocked" && agent?.disallowedMcpTools?.includes("docs/search_docs")), "agent_list should expose custom agent MCP denylist metadata");
+  assert(agentList.payload?.data?.agents?.some((agent) => agent?.name === "maintainer" && agent?.background === true && agent?.isolation === "worktree" && agent?.effort === "medium" && agent?.commands?.includes("review-flow") && agent?.mcpTools?.includes("docs/search_docs")), "agent_list should expose agent_write structured metadata");
   const agentRead = await request("/tools/agent_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2104,6 +3327,19 @@ try {
     body: JSON.stringify({ name: "effortful" }),
   });
   assert(effortfulAgentRead.payload?.data?.agent?.effort === "low", "agent_read should expose custom agent effort metadata");
+  const mcpReaderAgentRead = await request("/tools/agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "mcpreader" }),
+  });
+  assert(mcpReaderAgentRead.payload?.data?.agent?.mcpTools?.includes("docs/search_docs"), "agent_read should expose custom agent MCP allowlist metadata");
+  const maintainerAgentRead = await request("/tools/agent_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "maintainer" }),
+  });
+  assert(String(maintainerAgentRead.payload?.data?.agent?.initialPrompt || "").includes("second maintainer line"), "agent_read should expose agent_write block initialPrompt metadata");
+  assert(maintainerAgentRead.payload?.data?.agent?.memories?.includes("project:testing-policy"), "agent_read should expose agent_write memory metadata");
   const agentReadBlocked = await request("/tools/agent_read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2240,6 +3476,14 @@ try {
   assert(todoWrite.payload?.data?.count === 3, "todo_write should return todo count");
   assert(todoWrite.payload?.data?.todos?.[1]?.status === "doing", "todo_write should preserve todo status");
   assert(String(todoWrite.payload?.data?.summary || "").includes("Write crawler code"), "todo_write should return a readable summary");
+  const todoClear = await request("/tools/todo_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      todos: todoWrite.payload.data.todos.map((todo) => ({ ...todo, status: "done" })),
+    }),
+  });
+  assert(todoClear.payload?.ok === true, "todo_write should clear seeded tool-test todos before agent session smoke");
 
   const python = await request("/tools/run_python", {
     method: "POST",
@@ -2283,8 +3527,8 @@ try {
   assert(completed?.data?.model === "deepseek-v4-pro", "session summary should retain web-provided model");
 
   const sessionDir = path.join(workspace, ".oases", "ocli", "sessions", sessionId);
-  const metadata = JSON.parse(await readTextEventually(path.join(sessionDir, "metadata.json")));
-  const result = JSON.parse(await readTextEventually(path.join(sessionDir, "result.json")));
+  const metadata = await readJsonEventually(path.join(sessionDir, "metadata.json"), (value) => value?.status === "completed");
+  const result = await readJsonEventually(path.join(sessionDir, "result.json"), (value) => value?.status === "completed" || value?.result);
   const events = await readTextEventually(path.join(sessionDir, "events.ndjson"));
   assert(metadata.model === "deepseek-v4-pro", "persisted metadata should retain web-provided model");
   assert(metadata.status === "completed", "persisted metadata should mark completed session");
@@ -2299,6 +3543,102 @@ try {
   assert(healthWithSessions.payload?.activeSessionCount === 0, "/health should expose active local agent session count");
   assert(healthWithSessions.payload?.latestSession?.id === sessionId, "/health should expose the latest local agent session summary");
   assert(healthWithSessions.payload?.latestSession?.status === "completed", "/health latest session should include status");
+
+  const kimiModelProfileStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "kimi-k2.6",
+      systemPrompt: "ocli Kimi model profile smoke prompt",
+      messages: [{ role: "user", content: "kimi model profile smoke" }],
+      maxTurns: 1,
+    }),
+  });
+  assert(kimiModelProfileStarted.response.status === 202, "Kimi model profile smoke session should start");
+  const kimiModelProfileCompleted = await waitForSessionDone(kimiModelProfileStarted.payload?.data?.id);
+  assert(kimiModelProfileCompleted?.data?.status === "completed", "Kimi model profile smoke session should complete");
+  assert(kimiModelProfileCompleted?.data?.result?.finalText?.includes("kimi model profile smoke completed"), "Kimi model profile smoke should reach final response");
+  assert(kimiModelProfileCompleted?.data?.result?.modelRequestProfile?.temperature === 1, "Kimi model profile should record fixed temperature=1");
+  assert(kimiModelProfileCompleted?.data?.result?.modelRequestProfile?.supportsEffort === false, "Kimi model profile should omit effort fields");
+  assert(kimiModelProfileCompleted?.events?.some((event) => event?.type === "model_request_profile" && event?.temperaturePolicy === "fixed" && event?.supportsEffort === false), "Kimi model profile event should expose the fixed no-effort policy");
+
+  const gptModelProfileStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "gpt-5.4",
+      systemPrompt: "ocli GPT model profile smoke prompt",
+      messages: [{ role: "user", content: "gpt model profile smoke" }],
+      maxTurns: 1,
+    }),
+  });
+  assert(gptModelProfileStarted.response.status === 202, "GPT model profile smoke session should start");
+  const gptModelProfileCompleted = await waitForSessionDone(gptModelProfileStarted.payload?.data?.id);
+  assert(gptModelProfileCompleted?.data?.status === "completed", "GPT model profile smoke session should complete");
+  assert(gptModelProfileCompleted?.data?.result?.finalText?.includes("gpt model profile smoke completed"), "GPT model profile smoke should reach final response");
+  assert(gptModelProfileCompleted?.data?.result?.modelRequestProfile?.temperature === 1, "GPT model profile should record fixed temperature=1");
+  assert(gptModelProfileCompleted?.data?.result?.modelRequestProfile?.effort === "high", "GPT model profile should retain the default high effort");
+
+  const modelRetryStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli model retry smoke prompt",
+      messages: [{ role: "user", content: "model retry smoke" }],
+      maxTurns: 1,
+    }),
+  });
+  assert(modelRetryStarted.response.status === 202, "model retry smoke session should start");
+  const modelRetryCompleted = await waitForSessionDone(modelRetryStarted.payload?.data?.id);
+  assert(modelRetryCompleted?.data?.status === "completed", "model retry smoke session should complete after retry");
+  assert(modelRetryCompleted?.data?.result?.finalText?.includes("model retry smoke completed"), "model retry smoke should reach final response");
+  assert(modelRetryCompleted?.data?.result?.modelRequestRetryCount === 1, "model retry smoke should record one model request retry");
+  assert(modelRetryCompleted?.events?.some((event) => event?.type === "model_request_retry" && event?.status === 500 && event?.nextAttempt === 2), "model retry smoke should emit retry telemetry");
+  assert(modelRetryCompleted?.events?.some((event) => event?.type === "model_request_recovered" && event?.retryCount === 1), "model retry smoke should emit recovery telemetry");
+
+  const modelRepairStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "repair-temp-smoke",
+      systemPrompt: "ocli model repair smoke prompt",
+      messages: [{ role: "user", content: "model repair smoke" }],
+      maxTurns: 1,
+    }),
+  });
+  assert(modelRepairStarted.response.status === 202, "model repair smoke session should start");
+  const modelRepairCompleted = await waitForSessionDone(modelRepairStarted.payload?.data?.id);
+  assert(modelRepairCompleted?.data?.status === "completed", "model repair smoke session should complete after parameter repair");
+  assert(modelRepairCompleted?.data?.result?.finalText?.includes("model repair smoke completed"), "model repair smoke should reach final response");
+  assert(modelRepairCompleted?.data?.result?.modelRequestRepairCount === 1, "model repair smoke should record one model request repair");
+  assert(!modelRepairCompleted?.data?.result?.modelRequestRetryCount, "model repair smoke should not count parameter repair as transient retry");
+  assert(modelRepairCompleted?.data?.result?.modelRequestRepairs?.some((repair) => repair?.key === "temperature_fixed_1" && repair?.changedKeys?.includes("temperature")), "model repair smoke should record temperature repair metadata");
+  assert(modelRepairCompleted?.events?.some((event) => event?.type === "model_request_repair" && event?.status === 400 && event?.repair?.key === "temperature_fixed_1" && event?.changedKeys?.includes("temperature")), "model repair smoke should emit repair telemetry");
+  assert(modelRepairCompleted?.events?.some((event) => event?.type === "model_request_recovered" && event?.repairCount === 1 && event?.retryCount === 0), "model repair smoke should emit recovery telemetry with repair count");
+
+  const modelEffortRepairStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "gpt-5.4",
+      systemPrompt: "ocli model effort repair smoke prompt",
+      messages: [{ role: "user", content: "model effort repair smoke" }],
+      maxTurns: 1,
+    }),
+  });
+  assert(modelEffortRepairStarted.response.status === 202, "model effort repair smoke session should start");
+  const modelEffortRepairCompleted = await waitForSessionDone(modelEffortRepairStarted.payload?.data?.id);
+  assert(modelEffortRepairCompleted?.data?.status === "completed", "model effort repair smoke session should complete after effort repair");
+  assert(modelEffortRepairCompleted?.data?.result?.finalText?.includes("model effort repair smoke completed"), "model effort repair smoke should reach final response");
+  assert(modelEffortRepairCompleted?.data?.result?.modelRequestRepairCount === 1, "model effort repair smoke should record one model request repair");
+  assert(modelEffortRepairCompleted?.data?.result?.modelRequestRepairs?.some((repair) => repair?.key === "effort_removed" && repair?.removedKeys?.includes("reasoning_effort")), "model effort repair smoke should record effort removal metadata");
+  assert(modelEffortRepairCompleted?.events?.some((event) => event?.type === "model_request_repair" && event?.repair?.key === "effort_removed" && event?.removedKeys?.includes("effort") && event?.removedKeys?.includes("reasoning_effort")), "model effort repair smoke should emit effort removal telemetry");
 
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
@@ -2315,6 +3655,61 @@ try {
   assert(Array.isArray(persistedDetail.payload?.events) && persistedDetail.payload.events.some((event) => event?.type === "done"), "persisted session detail should include persisted events");
   assert(persistedDetail.payload?.eventCounts?.done === 1, "persisted session detail should include event counts");
   assert(Array.isArray(persistedDetail.payload?.toolResults), "persisted session detail should include tool result summaries");
+
+  const resumedSession = await request(`/agent/sessions/${encodeURIComponent(sessionId)}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert(resumedSession.response.status === 202, "resume endpoint should start a new agent session");
+  const resumedSessionId = resumedSession.payload?.data?.id;
+  assert(typeof resumedSessionId === "string" && resumedSessionId !== sessionId, "resume endpoint should create a distinct session id");
+  assert(resumedSession.payload?.data?.resumedFromSessionId === sessionId, "resumed session summary should point to the source session");
+  const resumedCompleted = await waitForSessionDone(resumedSessionId);
+  assert(resumedCompleted?.data?.status === "completed", "resumed session should complete");
+  assert(resumedCompleted?.data?.resumedFromSessionId === sessionId, "resumed session detail should retain source session id");
+  assert(resumedCompleted?.data?.result?.finalText?.includes("resume endpoint smoke completed"), `resumed session should run from the generated resume prompt: ${JSON.stringify({ finalText: resumedCompleted?.data?.result?.finalText, events: resumedCompleted?.events }, null, 2)}`);
+  assert(resumedCompleted?.events?.some((event) => event?.type === "session_resumed" && event?.resumedFromSessionId === sessionId), "resumed session should persist a session_resumed event");
+
+  const failedRecoveryStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli failed recovery smoke prompt",
+      messages: [{ role: "user", content: "failed recovery smoke" }],
+      maxTurns: 2,
+    }),
+  });
+  assert(failedRecoveryStarted.response.status === 202, "failed recovery smoke session should start");
+  const failedRecoverySessionId = failedRecoveryStarted.payload?.data?.id;
+  assert(typeof failedRecoverySessionId === "string", "failed recovery smoke session should have an id");
+  const failedRecoveryDetail = await waitForSessionDone(failedRecoverySessionId);
+  assert(failedRecoveryDetail?.data?.status === "failed", "failed recovery source session should fail before resume");
+  assert(failedRecoveryDetail?.data?.needsContinuation === true, "failed recovery source session should need continuation");
+  assert(failedRecoveryDetail?.data?.stoppedReason === "failed", "failed recovery source session should expose failed stoppedReason");
+  assert(String(failedRecoveryDetail?.data?.error || "").includes("recoverable model outage for failed recovery smoke"), "failed recovery source session should preserve the model error");
+  assert(String(failedRecoveryDetail?.resumePrompt || "").includes("上次错误：") && String(failedRecoveryDetail?.resumePrompt || "").includes("recoverable model outage for failed recovery smoke"), "failed recovery detail should include the source error in resume prompt");
+  const failedRecoveryHealth = await request("/health");
+  assert(failedRecoveryHealth.payload?.latestSession?.id === failedRecoverySessionId, "health latest session should be the failed recovery source session");
+  assert(failedRecoveryHealth.payload?.latestSession?.needsContinuation === true && failedRecoveryHealth.payload?.latestSession?.stoppedReason === "failed", "health should expose failed sessions as needing continuation");
+  const failedRecoveryList = await request("/agent/sessions");
+  const listedFailedRecovery = failedRecoveryList.payload?.data?.sessions?.find((session) => session?.id === failedRecoverySessionId);
+  assert(listedFailedRecovery?.needsContinuation === true && listedFailedRecovery?.stoppedReason === "failed", "session list should expose failed sessions needing continuation");
+  const failedRecoveryResumed = await request(`/agent/sessions/${encodeURIComponent(failedRecoverySessionId)}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert(failedRecoveryResumed.response.status === 202, "failed recovery resume endpoint should start a new session");
+  const failedRecoveryResumedId = failedRecoveryResumed.payload?.data?.id;
+  assert(typeof failedRecoveryResumedId === "string" && failedRecoveryResumedId !== failedRecoverySessionId, "failed recovery resume should create a distinct session");
+  assert(failedRecoveryResumed.payload?.data?.resumedFromSessionId === failedRecoverySessionId, "failed recovery resumed session should point to the failed source");
+  const failedRecoveryCompleted = await waitForSessionDone(failedRecoveryResumedId);
+  assert(failedRecoveryCompleted?.data?.status === "completed", "failed recovery resumed session should complete");
+  assert(failedRecoveryCompleted?.data?.result?.finalText?.includes("failed recovery resume completed"), "failed recovery resume should reach the model recovery response");
+  assert(failedRecoveryCompleted?.events?.some((event) => event?.type === "session_resumed" && event?.resumedFromSessionId === failedRecoverySessionId), "failed recovery resume should persist session_resumed event");
 
   const nativeToolStarted = await request("/agent/sessions", {
     method: "POST",
@@ -2361,6 +3756,10 @@ try {
   assert(subagentCompleted?.events?.some((event) => event?.type === "subagent_start"), "agent_run should emit subagent_start events");
   assert(subagentCompleted?.events?.some((event) => event?.type === "subagent_done"), "agent_run should emit subagent_done events");
   assert(subagentCompleted?.events?.some((event) => event?.type === "subagent_event" && event?.event?.type === "tool_result" && event?.event?.result?.name === "read_file"), "sub-agent tool events should be surfaced to the parent session");
+  const subagentMemorySuggestion = subagentCompleted?.data?.result?.memoryMaintenance?.suggestion || {};
+  assert(String(subagentMemorySuggestion?.content || "").includes("## Sub-agent Evidence"), "sub-agent memory suggestion should include sub-agent evidence");
+  assert(String(subagentMemorySuggestion?.content || "").includes("subagent found delegation target marker"), "sub-agent memory suggestion should preserve the sub-agent final text");
+  assert(subagentMemorySuggestion?.evidence?.subAgentCount >= 1, "sub-agent memory suggestion should count sub-agent evidence");
 
   await request("/tools/write_file", {
     method: "POST",
@@ -2388,6 +3787,48 @@ try {
   assert(customAgentResult?.data?.agentType === "verify", "custom agent metadata should override the sub-agent role");
   assert(String(customAgentResult?.data?.finalText || "").includes("custom agent used custom reviewer marker"), "custom agent prompt should be injected into the sub-agent");
   assert(customAgentCompleted?.events?.some((event) => event?.type === "subagent_start" && event?.agentName === "reviewer"), "custom agent_run should emit subagent_start metadata");
+
+  const autoAgentRoutingStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli auto agent routing smoke prompt",
+      messages: [{ role: "user", content: "auto reviewer routing smoke: use reviewer custom agent to review src/custom-agent-target.txt." }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(autoAgentRoutingStarted.response.status === 202, "auto agent routing smoke session should start");
+  const autoAgentRoutingCompleted = await waitForSessionDone(autoAgentRoutingStarted.payload?.data?.id);
+  assert(autoAgentRoutingCompleted?.data?.status === "completed", "auto agent routing smoke session should complete");
+  assert(autoAgentRoutingCompleted?.data?.result?.finalText?.includes("auto agent routing smoke completed"), "auto agent routing smoke should reach final response");
+  assert(autoAgentRoutingCompleted?.events?.some((event) => event?.type === "agent_loaded" && event?.autoRouted === true && event?.agent?.name === "reviewer"), "auto capability routing should auto-load matching custom agents");
+  assert(autoAgentRoutingCompleted?.data?.result?.capabilityRouting?.selected?.agents?.some((agent) => agent?.name === "reviewer" && agent?.path === ".oases/agents/reviewer.md"), "auto capability routing should record selected custom agents");
+  assert(autoAgentRoutingCompleted?.data?.result?.activeAgents?.some((agent) => agent?.name === "reviewer"), "auto-routed custom agents should be recorded in the agent result");
+  assert(autoAgentRoutingCompleted?.data?.result?.toolResults?.some((result) => result?.name === "agent_run" && result?.data?.agentName === "reviewer"), "auto-routed custom agent context should guide the model to delegate with agent_run");
+
+  const pluginAgentDelegationStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli plugin agent delegation smoke prompt",
+      messages: [{ role: "user", content: "plugin agent delegation smoke" }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(pluginAgentDelegationStarted.response.status === 202, "plugin agent delegation smoke session should start");
+  const pluginAgentDelegationCompleted = await waitForSessionDone(pluginAgentDelegationStarted.payload?.data?.id);
+  assert(pluginAgentDelegationCompleted?.data?.status === "completed", "plugin agent delegation smoke session should complete");
+  assert(pluginAgentDelegationCompleted?.data?.result?.finalText?.includes("plugin agent delegation smoke completed"), "plugin agent delegation smoke should reach final response");
+  const pluginAgentResult = pluginAgentDelegationCompleted?.data?.result?.toolResults?.find((result) => result?.name === "agent_run" && result?.data?.agentName === "plugin-explorer");
+  assert(pluginAgentResult?.data?.customAgent?.source === "plugin" && pluginAgentResult?.data?.customAgent?.plugin === "route-pack", "agent_run should load plugin agent metadata without installing it");
+  assert(String(pluginAgentResult?.data?.finalText || "").includes("plugin direct agent saw plugin direct marker"), "plugin agent prompt should be injected into the delegated sub-agent");
+  assert(pluginAgentResult?.data?.invokedSkills?.some((skill) => skill?.name === "plugin-route-helper" && skill?.source === "plugin"), "plugin agent declared plugin skills should preload into the sub-agent");
 
   const limitedCustomAgentStarted = await request("/agent/sessions", {
     method: "POST",
@@ -2417,6 +3858,49 @@ try {
     restrictedWriteExists = false;
   }
   assert(!restrictedWriteExists, "limited custom agent should not write files blocked by its tool scope");
+
+  const mcpAllowAgentStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli custom agent MCP allow smoke prompt",
+      messages: [{ role: "user", content: "custom agent mcp allow smoke" }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(mcpAllowAgentStarted.response.status === 202, "custom agent MCP allow smoke session should start");
+  const mcpAllowAgentCompleted = await waitForSessionDone(mcpAllowAgentStarted.payload?.data?.id);
+  assert(mcpAllowAgentCompleted?.data?.status === "completed", "custom agent MCP allow smoke session should complete");
+  assert(mcpAllowAgentCompleted?.data?.result?.finalText?.includes("custom agent mcp allow smoke completed"), "custom agent MCP allow smoke should reach final response");
+  const mcpAllowAgentResult = mcpAllowAgentCompleted?.data?.result?.toolResults?.find((result) => result?.name === "agent_run" && result?.data?.agentName === "mcpreader");
+  assert(mcpAllowAgentResult?.data?.customAgent?.mcpTools?.includes("docs/search_docs"), "custom agent MCP allow result should expose declared MCP allowlist metadata");
+  assert(mcpAllowAgentResult?.data?.toolResults?.some((result) => result?.name === "mcp_call" && result?.ok === true && result?.data?.server === "docs" && result?.data?.tool === "search_docs"), "custom agent MCP allowlist should permit matching MCP calls");
+
+  const mcpDenyAgentStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli custom agent MCP deny smoke prompt",
+      messages: [{ role: "user", content: "custom agent mcp deny smoke" }],
+      maxTurns: 6,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(mcpDenyAgentStarted.response.status === 202, "custom agent MCP deny smoke session should start");
+  const mcpDenyAgentCompleted = await waitForSessionDone(mcpDenyAgentStarted.payload?.data?.id);
+  assert(mcpDenyAgentCompleted?.data?.status === "completed", "custom agent MCP deny smoke session should complete");
+  assert(
+    mcpDenyAgentCompleted?.data?.result?.finalText?.includes("custom agent mcp deny smoke completed"),
+    `custom agent MCP deny smoke should reach final response: ${JSON.stringify(mcpDenyAgentCompleted?.data?.result || {}, null, 2)}`,
+  );
+  const mcpDenyAgentResult = mcpDenyAgentCompleted?.data?.result?.toolResults?.find((result) => result?.name === "agent_run" && result?.data?.agentName === "mcpblocked");
+  assert(mcpDenyAgentResult?.data?.customAgent?.disallowedMcpTools?.includes("docs/search_docs"), "custom agent MCP deny result should expose declared MCP denylist metadata");
+  assert(mcpDenyAgentResult?.data?.toolResults?.some((result) => result?.name === "mcp_call" && result?.ok === false && String(result?.message || "").includes("MCP tool docs/search_docs is not allowed")), "custom agent MCP denylist should block matching MCP calls before execution");
 
   const skillPreloadAgentStarted = await request("/agent/sessions", {
     method: "POST",
@@ -2650,6 +4134,21 @@ try {
   assert(approvalEvent.tool === "run_python", "approval request should be for run_python");
   assert(approvalEvent.category === "file_modifying_python", "approval request should include a file-modifying permission category");
   assert(String(approvalEvent.reason || "").includes("Python"), "approval request should include a human-readable reason");
+  assert(approvalEvent.actionable === true && approvalEvent.source === "live", "session detail should expose live actionable pending approvals");
+  assert(String(approvalEvent.arguments?.script || "").includes("approval-smoke.txt"), "pending approval detail should preserve tool arguments");
+  const approvalHealth = await request("/health");
+  assert(approvalHealth.payload?.pendingApprovalCount >= 1, "health summary should expose pending approval count");
+  assert(approvalHealth.payload?.latestSession?.waitingForApproval === true, "health summary latest session should show waiting approval");
+  const approvalList = await request("/agent/sessions");
+  const listedApprovalSession = approvalList.payload?.data?.sessions?.find((session) => session?.id === approvalSessionId);
+  assert(listedApprovalSession?.pendingApprovalCount >= 1 && listedApprovalSession?.waitingForApproval === true, "session list should expose waiting approval status");
+  const blockedApprovalResume = await request(`/agent/sessions/${encodeURIComponent(approvalSessionId)}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert(blockedApprovalResume.response.status === 409, "resume endpoint should reject sessions with pending approvals");
+  assert(String(blockedApprovalResume.payload?.error || "").includes("approval request"), "resume rejection should explain pending approval blockers");
   const approved = await request(`/agent/sessions/${encodeURIComponent(approvalSessionId)}/approvals/${encodeURIComponent(approvalEvent.approvalId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2658,6 +4157,9 @@ try {
   assert(approved.payload?.data?.approved === true, "approval endpoint should approve the pending tool");
   const approvalCompleted = await waitForSessionDone(approvalSessionId);
   assert(approvalCompleted?.data?.result?.finalText?.includes("approval smoke completed"), "approval session should complete after approved tool execution");
+  assert(Array.isArray(approvalCompleted?.pendingApprovals) && approvalCompleted.pendingApprovals.length === 0, "pending approval detail should clear after approval resolution");
+  const approvalHealthAfter = await request("/health");
+  assert(Number(approvalHealthAfter.payload?.pendingApprovalCount || 0) === 0, "health summary should clear pending approval count after approval resolution");
   const approvalEvents = await readTextEventually(path.join(workspace, ".oases", "ocli", "sessions", approvalSessionId, "events.ndjson"));
   assert(approvalEvents.includes('"type":"approval_required"') && approvalEvents.includes('"type":"approval_resolved"'), "approval events should be persisted");
 
@@ -2748,6 +4250,581 @@ try {
   assert(unfinishedContinuationCompleted?.events?.some((event) => event?.type === "auto_continue"), "unfinished no-tool model text should trigger auto_continue");
   assert((await readTextEventually(path.join(workspace, "generated", "unfinished-output.txt"))).includes("unfinished continuation smoke ok"), "unfinished continuation should force the model to produce the promised file");
 
+  const completionGuardStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli completion guard todo smoke prompt",
+      messages: [{ role: "user", content: "completion guard todo smoke" }],
+      maxTurns: 2,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(completionGuardStarted.response.status === 202, "completion guard todo smoke session should start");
+  const completionGuardCompleted = await waitForSessionDone(completionGuardStarted.payload?.data?.id);
+  assert(completionGuardCompleted?.data?.status === "completed", "completion guard todo smoke session should complete after automatic follow-up");
+  assert(completionGuardCompleted?.data?.result?.finalText?.includes("completion guard todo smoke completed"), "completion guard todo smoke should reach the final response");
+  assert(completionGuardCompleted?.events?.some((event) => event?.type === "auto_continue" && event?.reason === "open_todo"), "open todo text should trigger an auto_continue event with reason=open_todo");
+  assert((await readTextEventually(path.join(workspace, "guard", "todo-output.txt"))).includes("completion guard todo smoke ok"), "completion guard should force the model to produce the promised artifact");
+
+  const postToolContinuationStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli post tool continuation smoke prompt",
+      messages: [{ role: "user", content: "post tool continuation smoke" }],
+      maxTurns: 3,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(postToolContinuationStarted.response.status === 202, "post-tool continuation smoke session should start");
+  const postToolContinuationCompleted = await waitForSessionDone(postToolContinuationStarted.payload?.data?.id);
+  assert(postToolContinuationCompleted?.data?.status === "completed", "post-tool continuation smoke session should complete");
+  assert(postToolContinuationCompleted?.data?.result?.finalText?.includes("post tool continuation smoke completed"), `post-tool continuation smoke should not stop at the first tool result: ${JSON.stringify({ finalText: postToolContinuationCompleted?.data?.result?.finalText, events: postToolContinuationCompleted?.events }, null, 2)}`);
+  assert(postToolContinuationCompleted?.events?.some((event) => event?.type === "auto_continue" && event?.reason === "promised_follow_up" && event?.afterToolResults === true), "post-tool promised follow-up should emit auto_continue after tool results");
+  assert((await readTextEventually(path.join(workspace, "guard", "post-tool-output.txt"))).includes("post tool continuation file"), "post-tool continuation should preserve the first generated file");
+  assert((await readTextEventually(path.join(workspace, "guard", "post-tool-verified.txt"))).includes("post tool continuation verified"), "post-tool continuation should force the promised follow-up verification artifact");
+
+  const persistentTodoWrite = await request("/tools/todo_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      todos: [{ id: "persisted-follow-up", text: "persisted follow-up", status: "doing" }],
+    }),
+  });
+  assert(persistentTodoWrite.payload?.ok === true, "persistent todo restore smoke should seed a persisted todo");
+  const persistentTodoRestoreStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli persistent todo restore smoke prompt",
+      messages: [{ role: "user", content: "persistent todo restore smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(persistentTodoRestoreStarted.response.status === 202, "persistent todo restore smoke session should start");
+  const persistentTodoRestoreCompleted = await waitForSessionDone(persistentTodoRestoreStarted.payload?.data?.id);
+  assert(persistentTodoRestoreCompleted?.data?.status === "completed", `persistent todo restore smoke session should complete: ${JSON.stringify({ data: persistentTodoRestoreCompleted?.data || {}, events: persistentTodoRestoreCompleted?.events || [] }, null, 2)}`);
+  assert(persistentTodoRestoreCompleted?.data?.result?.finalText === "persistent todo restore smoke completed", "persistent todo restore guard should ignore premature completion while restored todos are open");
+  assert(persistentTodoRestoreCompleted?.events?.some((event) => event?.type === "todo_state_loaded" && event?.openTodos?.some((todo) => todo?.text === "persisted follow-up" && todo?.status === "doing")), "persistent todo restore should load open todos at session start");
+  assert(persistentTodoRestoreCompleted?.events?.some((event) => event?.type === "auto_continue" && event?.reason === "open_todo_state"), "restored open todos should trigger auto_continue even when model claims completion");
+  assert(Array.isArray(persistentTodoRestoreCompleted?.data?.result?.openTodos) && persistentTodoRestoreCompleted.data.result.openTodos.length === 0, "persistent todo restore should finish only after restored todos are marked done");
+  assert(persistentTodoRestoreCompleted?.data?.result?.latestTodos?.every((todo) => todo?.status === "done"), "persistent todo restore should expose final done todo state");
+
+  const todoStateGuardStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli todo state guard smoke prompt",
+      messages: [{ role: "user", content: "todo state guard smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(todoStateGuardStarted.response.status === 202, "todo state guard smoke session should start");
+  const todoStateGuardCompleted = await waitForSessionDone(todoStateGuardStarted.payload?.data?.id);
+  assert(todoStateGuardCompleted?.data?.status === "completed", `todo state guard smoke session should complete: ${JSON.stringify({ data: todoStateGuardCompleted?.data || {}, events: todoStateGuardCompleted?.events || [] }, null, 2)}`);
+  assert(todoStateGuardCompleted?.data?.result?.finalText === "todo state guard smoke completed", `todo state guard should ignore premature completion while structured todos are open: ${JSON.stringify({ finalText: todoStateGuardCompleted?.data?.result?.finalText, result: todoStateGuardCompleted?.data?.result, events: todoStateGuardCompleted?.events }, null, 2)}`);
+  assert(todoStateGuardCompleted?.events?.some((event) => event?.type === "todo_state_updated" && event?.openTodos?.some((todo) => todo?.status === "doing")), "todo state guard should observe open structured todos");
+  assert(todoStateGuardCompleted?.events?.some((event) => event?.type === "auto_continue" && event?.reason === "open_todo_state"), "open structured todos should trigger auto_continue even when model claims completion");
+  assert(Array.isArray(todoStateGuardCompleted?.data?.result?.openTodos) && todoStateGuardCompleted.data.result.openTodos.length === 0, "todo state guard should finish only after todos are marked done");
+  assert(todoStateGuardCompleted?.data?.result?.latestTodos?.every((todo) => todo?.status === "done"), "todo state guard should expose final done todo state");
+
+  const longHistoryMessages = Array.from({ length: 18 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `compaction-history-marker-${index} ${"历史上下文片段 ".repeat(45)}`,
+  }));
+  longHistoryMessages.push({ role: "user", content: "context compaction smoke" });
+  const contextCompactionStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli context compaction smoke prompt",
+      messages: longHistoryMessages,
+      maxTurns: 2,
+      maxAutoContinuations: 0,
+      maxContextTokens: 900,
+      contextCompactionRatio: 0.9,
+      contextRecentMessages: 4,
+    }),
+  });
+  assert(contextCompactionStarted.response.status === 202, "context compaction smoke session should start");
+  const contextCompactionCompleted = await waitForSessionDone(contextCompactionStarted.payload?.data?.id);
+  assert(contextCompactionCompleted?.data?.status === "completed", `context compaction smoke session should complete: ${JSON.stringify({ data: contextCompactionCompleted?.data || {}, events: contextCompactionCompleted?.events || [] }, null, 2)}`);
+  assert(contextCompactionCompleted?.data?.result?.finalText?.includes("context compaction smoke completed"), "context compaction smoke should reach final response");
+  assert(contextCompactionCompleted?.events?.some((event) => event?.type === "context_compacted" && event.compactedMessageCount >= 10), "ocli should emit context_compacted when history crosses the configured threshold");
+  assert(contextCompactionCompleted?.events?.some((event) => event?.type === "context_compacted" && event.stateSnapshot === true), "ocli should emit context_compacted with a resumable state snapshot marker");
+  assert(contextCompactionCompleted?.data?.result?.contextCompactions?.some((item) => item?.beforeTokens > item?.thresholdTokens && item?.afterTokens < item?.beforeTokens && item?.stateSnapshot === true), "ocli result should record context compaction metadata and state snapshot availability");
+
+  const contextCompactionSettingsWrite = await request("/tools/settings_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        contextCompaction: {
+          enabled: true,
+          maxContextTokens: 900,
+          ratio: 0.9,
+          recentMessages: 4,
+        },
+      },
+    }),
+  });
+  assert(contextCompactionSettingsWrite.payload?.ok === true, "settings_write should allow contextCompaction settings");
+  const contextCompactionSettingsRead = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json" }),
+  });
+  assert(contextCompactionSettingsRead.payload?.data?.safeValues?.contextCompaction?.maxContextTokens === 900, "settings_read should expose safe contextCompaction maxContextTokens");
+  assert(contextCompactionSettingsRead.payload?.data?.safeValues?.contextCompaction?.ratio === 0.9, "settings_read should expose safe contextCompaction ratio");
+  const mcpSettingsSeedWrite = await request("/tools/settings_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        mcpServers: {
+          docs: { command: "node", args: ["server.js"], env: { DOCS_TOKEN: "local-secret" } },
+        },
+      },
+    }),
+  });
+  assert(mcpSettingsSeedWrite.payload?.ok === true, "settings_write should allow MCP server settings");
+  const mcpSettingsPatchWrite = await request("/tools/settings_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        mcpServers: {
+          docs: { command: "npx", args: ["-y", "server"] },
+        },
+      },
+    }),
+  });
+  assert(mcpSettingsPatchWrite.payload?.ok === true, "settings_write should merge MCP server settings");
+  const mcpSettingsRead = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json" }),
+  });
+  assert(mcpSettingsRead.payload?.data?.safeValues?.mcpServers?.servers?.docs?.command === "npx", "settings_read should expose merged MCP server command");
+  assert(mcpSettingsRead.payload?.data?.safeValues?.mcpServers?.servers?.docs?.args?.length === 2, "settings_read should expose merged MCP server args");
+  assert(mcpSettingsRead.payload?.data?.safeValues?.mcpServers?.servers?.docs?.envKeys?.includes("DOCS_TOKEN"), "settings_write should preserve existing MCP env keys when patch omits env");
+  assert(!JSON.stringify(mcpSettingsRead.payload?.data || {}).includes("local-secret"), "settings_read should not expose local MCP env values");
+  const settingsContextCompactionStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings context compaction smoke prompt",
+      messages: longHistoryMessages,
+      maxTurns: 2,
+      maxAutoContinuations: 0,
+    }),
+  });
+  assert(settingsContextCompactionStarted.response.status === 202, "settings context compaction smoke session should start");
+  const settingsContextCompactionCompleted = await waitForSessionDone(settingsContextCompactionStarted.payload?.data?.id);
+  assert(settingsContextCompactionCompleted?.data?.status === "completed", `settings context compaction smoke session should complete: ${JSON.stringify({ data: settingsContextCompactionCompleted?.data || {}, events: settingsContextCompactionCompleted?.events || [] }, null, 2)}`);
+  assert(settingsContextCompactionCompleted?.data?.result?.finalText?.includes("context compaction smoke completed"), "settings context compaction smoke should reach final response");
+  assert(settingsContextCompactionCompleted?.events?.some((event) => event?.type === "settings_context_compaction_loaded" && event?.policy?.maxContextTokens === 900 && event?.policy?.recentMessages === 4), "settings context compaction smoke should emit loaded policy metadata");
+  assert(settingsContextCompactionCompleted?.events?.some((event) => event?.type === "context_compacted" && event?.policy?.maxContextTokens === 900 && event?.policy?.recentMessages === 4), "settings context compaction smoke should use settings policy in compaction events");
+  assert(settingsContextCompactionCompleted?.data?.result?.settingsContextCompaction?.thresholdTokens === 810, "settings context compaction policy should be preserved in result metadata");
+  assert(settingsContextCompactionCompleted?.data?.result?.contextCompactions?.some((item) => item?.policy?.maxContextTokens === 900 && item?.policy?.recentMessages === 4), "settings context compaction metadata should be preserved with the compaction record");
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: {} }, null, 2) }),
+  });
+
+  const adaptiveTailMessages = Array.from({ length: 10 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `adaptive-tail-history-marker-${index} ${"旧上下文片段 ".repeat(35)}`,
+  }));
+  for (let index = 0; index < 7; index += 1) {
+    adaptiveTailMessages.push({
+      role: index % 2 === 0 ? "assistant" : "user",
+      content: `oversized-recent-marker-${index} ${"近期上下文很长，需要压缩到摘要而不是保留原文。".repeat(160)}`,
+    });
+  }
+  adaptiveTailMessages.push({ role: "user", content: "context compaction adaptive tail smoke" });
+  const adaptiveTailCompactionStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli context compaction adaptive tail smoke prompt",
+      messages: adaptiveTailMessages,
+      maxTurns: 2,
+      maxAutoContinuations: 0,
+      maxContextTokens: 4000,
+      contextCompactionRatio: 0.9,
+      contextRecentMessages: 8,
+    }),
+  });
+  assert(adaptiveTailCompactionStarted.response.status === 202, "adaptive tail compaction smoke session should start");
+  const adaptiveTailCompactionCompleted = await waitForSessionDone(adaptiveTailCompactionStarted.payload?.data?.id);
+  assert(adaptiveTailCompactionCompleted?.data?.status === "completed", `adaptive tail compaction smoke session should complete: ${JSON.stringify({ data: adaptiveTailCompactionCompleted?.data || {}, events: adaptiveTailCompactionCompleted?.events || [] }, null, 2)}`);
+  assert(adaptiveTailCompactionCompleted?.data?.result?.finalText?.includes("context compaction adaptive tail smoke completed"), "adaptive tail compaction smoke should reach final response");
+  const adaptiveTailEvent = adaptiveTailCompactionCompleted?.events?.find((event) => event?.type === "context_compacted" && event?.adaptiveRetainedMessageCount === true);
+  assert(adaptiveTailEvent?.requestedRetainedMessageCount === 8 && adaptiveTailEvent?.retainedMessageCount > 0 && adaptiveTailEvent.retainedMessageCount < 8, `adaptive compaction should shrink the retained recent tail: ${JSON.stringify(adaptiveTailCompactionCompleted?.events || [], null, 2)}`);
+  assert(adaptiveTailCompactionCompleted?.data?.result?.contextCompactions?.some((item) => item?.adaptiveRetainedMessageCount === true && item?.requestedRetainedMessageCount === 8 && item?.retainedMessageCount < 8), "adaptive retained count should be preserved in result metadata");
+
+  const compactionTodoSeed = await request("/tools/todo_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ todos: [{ id: "compaction-restored-todo", text: "compaction restored todo", status: "doing" }] }),
+  });
+  assert(compactionTodoSeed.payload?.ok === true, "context compaction todo state smoke should seed an open todo");
+  const todoCompactionMessages = Array.from({ length: 18 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `todo-compaction-history-marker-${index} ${"任务压缩历史片段 ".repeat(45)}`,
+  }));
+  todoCompactionMessages.push({ role: "user", content: "context compaction todo state smoke" });
+  const todoCompactionStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli context compaction todo state smoke prompt",
+      messages: todoCompactionMessages,
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+      maxContextTokens: 900,
+      contextCompactionRatio: 0.9,
+      contextRecentMessages: 4,
+    }),
+  });
+  assert(todoCompactionStarted.response.status === 202, "context compaction todo state smoke session should start");
+  const todoCompactionCompleted = await waitForSessionDone(todoCompactionStarted.payload?.data?.id);
+  assert(todoCompactionCompleted?.data?.status === "completed", `context compaction todo state smoke session should complete: ${JSON.stringify({ data: todoCompactionCompleted?.data || {}, events: todoCompactionCompleted?.events || [] }, null, 2)}`);
+  assert(todoCompactionCompleted?.data?.result?.finalText === "context compaction todo state smoke completed", "context compaction todo state smoke should finish after restored todo is done");
+  assert(todoCompactionCompleted?.events?.some((event) => event?.type === "todo_state_loaded" && event?.openTodos?.some((todo) => todo?.text === "compaction restored todo")), "context compaction todo state smoke should load persisted open todos");
+  assert(todoCompactionCompleted?.events?.some((event) => event?.type === "context_compacted" && event?.stateSnapshot === true), "context compaction todo state smoke should emit compaction snapshot");
+  assert(todoCompactionCompleted?.events?.some((event) => event?.type === "auto_continue" && event?.reason === "open_todo_state"), "context compaction todo state smoke should continue while restored todo is open");
+  assert(Array.isArray(todoCompactionCompleted?.data?.result?.openTodos) && todoCompactionCompleted.data.result.openTodos.length === 0, "context compaction todo state smoke should finish with no open todos");
+  assert(todoCompactionCompleted?.data?.result?.latestTodos?.some((todo) => todo?.text === "compaction restored todo" && todo?.status === "done"), "context compaction todo state smoke should preserve final todo metadata");
+
+  const mcpCompactionMessages = Array.from({ length: 18 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `compaction-history-marker-${index} ${"MCP 历史上下文片段 ".repeat(45)}`,
+  }));
+  mcpCompactionMessages.push({ role: "user", content: "context compaction smoke with mcp evidence: use docs MCP search_docs capability and testing-policy memory." });
+  const mcpCompactionStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli context compaction MCP evidence smoke prompt",
+      messages: mcpCompactionMessages,
+      maxTurns: 2,
+      maxAutoContinuations: 0,
+      maxContextTokens: 900,
+      contextCompactionRatio: 0.9,
+      contextRecentMessages: 4,
+    }),
+  });
+  assert(mcpCompactionStarted.response.status === 202, "context compaction MCP evidence smoke session should start");
+  const mcpCompactionSessionId = mcpCompactionStarted.payload?.data?.id;
+  const mcpCompactionCompleted = await waitForSessionDone(mcpCompactionSessionId);
+  assert(mcpCompactionCompleted?.data?.status === "completed", `context compaction MCP evidence smoke session should complete: ${JSON.stringify({ data: mcpCompactionCompleted?.data || {}, events: mcpCompactionCompleted?.events || [] }, null, 2)}`);
+  assert(mcpCompactionCompleted?.data?.result?.finalText?.includes("context compaction mcp evidence smoke completed"), "context compaction MCP evidence smoke should reach final response");
+  assert(mcpCompactionCompleted?.events?.some((event) => event?.type === "memory_auto_searched" && event?.results?.some((result) => result?.name === "testing-policy")), "context compaction MCP evidence smoke should auto-search matching memory before compaction");
+  assert(mcpCompactionCompleted?.events?.some((event) => event?.type === "mcp_auto_called" && event?.server === "docs" && event?.tool === "search_docs"), "context compaction MCP evidence smoke should auto-call matching MCP before compaction");
+  assert(mcpCompactionCompleted?.events?.some((event) => event?.type === "context_compacted" && event?.stateSnapshot === true), "context compaction MCP evidence smoke should emit state-snapshot compaction");
+  assert(mcpCompactionCompleted?.data?.result?.capabilityRouting?.autoMemoryResults?.some((result) => result?.name === "testing-policy" && String(result?.snippet || "").includes("ocli smoke tests")), "context compaction MCP evidence smoke should retain auto memory RAG results in final metadata");
+  assert(mcpCompactionCompleted?.data?.result?.capabilityRouting?.autoMcpResults?.some((result) => result?.server === "docs" && result?.tool === "search_docs" && String(result?.resultText || "").includes("docs result for")), "context compaction MCP evidence smoke should retain auto MCP results in final metadata");
+  assert(mcpCompactionCompleted?.data?.result?.capabilityRouting?.diagnostics?.some((diagnostic) => diagnostic?.categories?.mcpTools?.selectedCount >= 1 && diagnostic?.categories?.memories?.candidateCount >= 1), "context compaction MCP evidence smoke should retain routing diagnostics in final metadata");
+  const resumeStructuredStarted = await request(`/agent/sessions/${encodeURIComponent(mcpCompactionSessionId)}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ maxTurns: 2, maxAutoContinuations: 0 }),
+  });
+  assert(resumeStructuredStarted.response.status === 202, "structured resume context smoke should start");
+  const resumeStructuredCompleted = await waitForSessionDone(resumeStructuredStarted.payload?.data?.id);
+  assert(resumeStructuredCompleted?.data?.status === "completed", `structured resume context smoke should complete: ${JSON.stringify({ data: resumeStructuredCompleted?.data || {}, events: resumeStructuredCompleted?.events || [] }, null, 2)}`);
+  assert(resumeStructuredCompleted?.data?.resumedFromSessionId === mcpCompactionSessionId, "structured resume context smoke should retain source session id");
+  assert(resumeStructuredCompleted?.data?.result?.finalText?.includes("resume structured context smoke completed"), `structured resume context should preserve prior capability/RAG/MCP/compaction evidence for the model: ${JSON.stringify({ data: resumeStructuredCompleted?.data || {}, events: resumeStructuredCompleted?.events || [] }, null, 2)}`);
+  assert(resumeStructuredCompleted?.events?.some((event) => event?.type === "session_resumed" && event?.resumedFromSessionId === mcpCompactionSessionId), "structured resume context smoke should persist session_resumed event");
+
+  const recursiveResumeSnapshot = {
+    currentTask: "previous compacted resume task",
+    sessionResumeContext: {
+      sourceSessionId: "sess_recursive_source",
+      sourceStatus: "completed",
+      stoppedReason: "completed",
+      finalText: "context compaction mcp evidence smoke completed",
+      activeCapabilities: {
+        memories: [{ name: "testing-policy", path: ".oases/memory/project/testing-policy.md" }],
+        mcpTools: [{ server: "docs", name: "search_docs" }],
+      },
+      autoMemoryResults: [{ name: "testing-policy", snippet: "ocli smoke tests before release" }],
+      autoMcpResults: [{ server: "docs", tool: "search_docs", resultText: "docs result for recursive resume context" }],
+      routingDiagnostics: [{
+        phase: "initial",
+        queryTerms: ["testing-policy", "docs", "search_docs"],
+        categories: {
+          memories: { candidateCount: 1, selectedCount: 1, threshold: 8 },
+          mcpTools: { candidateCount: 1, selectedCount: 1, threshold: 6 },
+        },
+      }],
+      contextCompactions: [{ turn: 0, stateSnapshot: true }],
+      todos: [{ id: "todo_recursive", text: "recursive resume todo", status: "doing" }],
+      openTodos: [{ id: "todo_recursive", text: "recursive resume todo", status: "doing" }],
+      todoCounts: { doing: 1 },
+    },
+    activeCapabilities: {},
+  };
+  const recursiveResumeMessages = [
+    {
+      role: "user",
+      content: [
+        '<context_compaction turn="1" compactedMessages="12" stateSnapshot="true">',
+        `<context_state_snapshot>${JSON.stringify(recursiveResumeSnapshot, null, 2)}</context_state_snapshot>`,
+        "previous compacted resume evidence summary",
+        "</context_compaction>",
+      ].join("\n"),
+    },
+    ...Array.from({ length: 14 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `recursive-resume-history-marker-${index} ${"recursive resume context filler ".repeat(45)}`,
+    })),
+    { role: "user", content: "recursive resume snapshot smoke: verify previously compacted session resume evidence survives another compaction." },
+  ];
+  const recursiveResumeStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli recursive resume snapshot smoke prompt",
+      messages: recursiveResumeMessages,
+      maxTurns: 1,
+      maxAutoContinuations: 0,
+      maxContextTokens: 900,
+      contextCompactionRatio: 0.9,
+      contextRecentMessages: 1,
+    }),
+  });
+  assert(recursiveResumeStarted.response.status === 202, "recursive resume snapshot smoke should start");
+  const recursiveResumeCompleted = await waitForSessionDone(recursiveResumeStarted.payload?.data?.id);
+  assert(recursiveResumeCompleted?.data?.status === "completed", `recursive resume snapshot smoke should complete: ${JSON.stringify({ data: recursiveResumeCompleted?.data || {}, events: recursiveResumeCompleted?.events || [] }, null, 2)}`);
+  assert(recursiveResumeCompleted?.data?.result?.finalText?.includes("recursive resume context compaction smoke completed"), "recursive resume snapshot smoke should preserve nested resume context across another compaction");
+  assert(recursiveResumeCompleted?.events?.some((event) => event?.type === "context_compacted" && event?.stateSnapshot === true), "recursive resume snapshot smoke should emit state-snapshot compaction");
+
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: "src/adaptive-trigger.txt",
+      content: "Use the research skill, load late-policy project memory, and call docs search_docs MCP before writing the adaptive output.\n",
+    }),
+  });
+  const adaptiveCapabilityRoutingStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli delayed run prompt",
+      messages: [{ role: "user", content: "delayed run check" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(adaptiveCapabilityRoutingStarted.response.status === 202, "adaptive capability routing smoke session should start");
+  const adaptiveCapabilityRoutingCompleted = await waitForSessionDone(adaptiveCapabilityRoutingStarted.payload?.data?.id);
+  assert(adaptiveCapabilityRoutingCompleted?.data?.status === "completed", `adaptive capability routing smoke session should complete: ${JSON.stringify({ data: adaptiveCapabilityRoutingCompleted?.data || {}, events: adaptiveCapabilityRoutingCompleted?.events || [] }, null, 2)}`);
+  assert(adaptiveCapabilityRoutingCompleted?.data?.result?.finalText?.includes("adaptive capability routing smoke completed"), "adaptive capability routing smoke should reach final response");
+  assert(!adaptiveCapabilityRoutingCompleted?.events?.some((event) => event?.type === "skill_loaded" && event?.turn === -1 && event?.skill?.name === "research"), "adaptive routing smoke should not load research during initial routing");
+  assert(adaptiveCapabilityRoutingCompleted?.events?.some((event) => event?.type === "capability_routing" && event?.phase === "adaptive" && event?.selected?.skills?.some((skill) => skill?.name === "research")), "adaptive capability routing should emit selected skill metadata after tool output");
+  assert(adaptiveCapabilityRoutingCompleted?.events?.some((event) => event?.type === "skill_loaded" && event?.adaptiveRouted === true && event?.skill?.name === "research"), "adaptive capability routing should load matching skills after tool output");
+  assert(adaptiveCapabilityRoutingCompleted?.events?.some((event) => event?.type === "memory_loaded" && event?.adaptiveRouted === true && event?.memory?.name === "late-policy"), "adaptive capability routing should load matching memories after tool output");
+  assert(adaptiveCapabilityRoutingCompleted?.events?.some((event) => event?.type === "mcp_auto_called" && event?.phase === "adaptive" && event?.server === "docs" && event?.tool === "search_docs"), "adaptive capability routing should auto-call matching MCP after tool output");
+  assert(adaptiveCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.selected?.memories?.some((memory) => memory?.name === "late-policy"), "adaptive capability routing should merge selected memories into result metadata");
+  assert((await readTextEventually(path.join(workspace, "auto", "adaptive-routing-output.txt"))).includes("adaptive routing loaded late skill memory and mcp"), "adaptive capability routing smoke should write output after late contexts are injected");
+
+  const autoCapabilityRoutingStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli auto capability routing smoke prompt",
+      messages: [{ role: "user", content: "auto capability routing smoke: use research skill, review-flow command, testing-policy memory, and docs MCP search_docs capability." }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(autoCapabilityRoutingStarted.response.status === 202, "auto capability routing smoke session should start");
+  const autoCapabilityRoutingCompleted = await waitForSessionDone(autoCapabilityRoutingStarted.payload?.data?.id);
+  assert(autoCapabilityRoutingCompleted?.data?.status === "completed", "auto capability routing smoke session should complete");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.finalText?.includes("auto capability routing smoke completed"), "auto capability routing smoke should reach final response");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "capability_routing" && event?.selected?.skills?.some((skill) => skill?.name === "research")), "auto capability routing should emit selected skill metadata");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "capability_routing" && event?.diagnostics?.categories?.skills?.selectedCount >= 1 && event?.diagnostics?.queryTerms?.includes("research")), "auto capability routing should emit routing diagnostics with query terms and category counts");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "capability_routing" && event?.diagnostics?.snapshot?.comparableWith === "capability_route_preview" && event?.diagnostics?.snapshot?.totalSelected >= 1 && typeof event?.diagnostics?.snapshot?.fingerprint === "string"), "auto capability routing should emit preview-comparable routing snapshot telemetry");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "skill_loaded" && event?.autoRouted === true && event?.skill?.name === "research"), "auto capability routing should auto-load matching skills");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "command_loaded" && event?.autoRouted === true && event?.command?.name === "review-flow"), "auto capability routing should auto-load matching commands");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "memory_loaded" && event?.autoRouted === true && event?.memory?.name === "testing-policy"), "auto capability routing should auto-load matching memories");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "memory_auto_searched" && event?.results?.some((result) => result?.name === "testing-policy" && String(result?.snippet || "").includes("ocli smoke tests"))), "auto capability routing should emit automatic memory RAG evidence");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "mcp_context_loaded" && event?.tools?.some((tool) => tool?.server === "docs" && tool?.name === "search_docs")), "auto capability routing should inject matching MCP tool metadata");
+  assert(autoCapabilityRoutingCompleted?.events?.some((event) => event?.type === "mcp_auto_called" && event?.server === "docs" && event?.tool === "search_docs" && String(event?.resultText || "").includes("docs result for")), "auto capability routing should auto-call matching read-only MCP tools");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.selected?.mcpTools?.some((tool) => tool?.server === "docs" && tool?.name === "search_docs"), "auto capability routing should be recorded in the result");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.diagnostics?.some((diagnostic) => diagnostic?.phase === "initial" && diagnostic?.categories?.skills?.selectedCount >= 1 && diagnostic?.categories?.mcpTools?.candidateCount >= 1), "auto capability routing should record routing diagnostics in the result");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.diagnostics?.some((diagnostic) => diagnostic?.snapshot?.comparableWith === "capability_route_preview" && diagnostic?.snapshot?.categories?.skills?.selectedKeys?.some((key) => String(key || "").includes("research"))), "auto capability routing should record preview-comparable routing snapshot in the result");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.autoMemoryResults?.some((result) => result?.name === "testing-policy" && String(result?.snippet || "").includes("ocli smoke tests") && result?.links?.includes("review-flow") && result?.backlinks?.some((link) => link?.name === "release-checklist")), "auto capability routing should record automatic memory RAG results in the result");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.autoMcpResults?.some((result) => result?.server === "docs" && result?.tool === "search_docs" && String(result?.resultText || "").includes("docs result for")), "auto capability routing should record auto MCP results in the result");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("## Memory RAG Evidence"), "auto capability routing memory suggestion should preserve memory RAG evidence");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("testing-policy"), "auto capability routing memory suggestion should preserve the auto memory result name");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("ocli smoke tests"), "auto capability routing memory suggestion should preserve the auto memory result snippet");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("docs/search_docs"), "auto capability routing memory suggestion should preserve the auto MCP tool name");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("docs result for"), "auto capability routing memory suggestion should preserve the auto MCP result text");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.evidence?.memoryRagResultCount >= 1, "auto capability routing memory suggestion should record memory RAG evidence count");
+  assert(autoCapabilityRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.evidence?.mcpResultCount >= 1, "auto capability routing memory suggestion should record MCP evidence count");
+  assert((await readTextEventually(path.join(workspace, "auto", "auto-routing-output.txt"))).includes("mcp result"), "auto capability routing smoke should write output after routed contexts and MCP results are injected");
+
+  const capabilityRoutingSettingsWrite = await request("/tools/settings_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      settings: {
+        capabilityRouting: {
+          includeAgents: false,
+          autoMcpCalls: false,
+          limits: {
+            skills: 0,
+            commands: 0,
+            memories: 1,
+            agents: 0,
+            frameworks: 0,
+            mcpTools: 0,
+            mcpResources: 0,
+            autoMcpCalls: 0,
+          },
+          memorySearch: { maxResults: 2, maxChars: 500 },
+          minScores: { memory: 1 },
+        },
+      },
+    }),
+  });
+  assert(capabilityRoutingSettingsWrite.payload?.ok === true, "settings_write should allow capabilityRouting settings");
+  const capabilityRoutingSettingsRead = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json" }),
+  });
+  assert(capabilityRoutingSettingsRead.payload?.data?.safeValues?.capabilityRouting?.limits?.skills === 0, "settings_read should expose safe capabilityRouting limits");
+  assert(capabilityRoutingSettingsRead.payload?.data?.safeValues?.capabilityRouting?.autoMcpCalls === false, "settings_read should expose safe capabilityRouting autoMcpCalls");
+  const settingsCapabilityRoutingStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli settings capability routing smoke prompt",
+      messages: [{ role: "user", content: "settings capability routing smoke: use research skill, review-flow command, testing-policy memory, and docs MCP search_docs capability." }],
+      maxTurns: 2,
+      maxAutoContinuations: 0,
+    }),
+  });
+  assert(settingsCapabilityRoutingStarted.response.status === 202, "settings capability routing smoke session should start");
+  const settingsCapabilityRoutingCompleted = await waitForSessionDone(settingsCapabilityRoutingStarted.payload?.data?.id);
+  assert(settingsCapabilityRoutingCompleted?.data?.status === "completed", `settings capability routing smoke should complete: ${JSON.stringify({ data: settingsCapabilityRoutingCompleted?.data || {}, events: settingsCapabilityRoutingCompleted?.events || [] }, null, 2)}`);
+  assert(settingsCapabilityRoutingCompleted?.data?.result?.finalText?.includes("settings capability routing smoke completed"), "settings capability routing smoke should reach final response");
+  assert(settingsCapabilityRoutingCompleted?.events?.some((event) => event?.type === "settings_capability_routing_loaded" && event?.policy?.limits?.skills === 0), "settings capability routing smoke should emit loaded policy metadata");
+  assert(settingsCapabilityRoutingCompleted?.events?.some((event) => event?.type === "capability_routing" && event?.diagnostics?.policy?.limits?.skills === 0 && event?.diagnostics?.categories?.skills?.selectedCount === 0), "capability routing diagnostics should use settings policy limits");
+  assert(settingsCapabilityRoutingCompleted?.events?.some((event) => event?.type === "memory_loaded" && event?.autoRouted === true && event?.memory?.name === "testing-policy"), "settings capability routing should still load the one allowed memory");
+  assert(!settingsCapabilityRoutingCompleted?.events?.some((event) => event?.type === "skill_loaded" && event?.autoRouted === true), "settings capability routing should suppress skill auto-routing when skills limit is zero");
+  assert(!settingsCapabilityRoutingCompleted?.events?.some((event) => event?.type === "command_loaded" && event?.autoRouted === true), "settings capability routing should suppress command auto-routing when commands limit is zero");
+  assert(!settingsCapabilityRoutingCompleted?.events?.some((event) => event?.type === "mcp_auto_called"), "settings capability routing should suppress automatic MCP calls");
+  assert(settingsCapabilityRoutingCompleted?.data?.result?.settingsCapabilityRouting?.limits?.memories === 1, "settings capability routing policy should be preserved in result metadata");
+  assert(settingsCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.selected?.memories?.length === 1, "settings capability routing should cap selected memories");
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: {} }, null, 2) }),
+  });
+
+  const agentFrameworkRoutingStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli agent framework routing smoke prompt",
+      messages: [{ role: "user", content: "agent framework routing smoke: use the research-stack framework orchestration." }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(agentFrameworkRoutingStarted.response.status === 202, "agent framework routing smoke session should start");
+  const agentFrameworkRoutingCompleted = await waitForSessionDone(agentFrameworkRoutingStarted.payload?.data?.id);
+  assert(agentFrameworkRoutingCompleted?.data?.status === "completed", "agent framework routing smoke session should complete");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.finalText?.includes("agent framework routing smoke completed"), "agent framework routing smoke should reach final response");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "agent_framework_loaded" && event?.autoRouted === true && event?.framework?.name === "research-stack"), "auto capability routing should auto-load matching agent frameworks");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "skill_loaded" && event?.autoRouted === true && event?.skill?.name === "research"), "agent framework routing should preload framework skills");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "memory_loaded" && event?.autoRouted === true && event?.memory?.name === "testing-policy"), "agent framework routing should preload framework memories");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "agent_loaded" && event?.autoRouted === true && event?.agent?.name === "reviewer"), "agent framework routing should preload framework agents");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "mcp_context_loaded" && event?.tools?.some((tool) => tool?.server === "docs" && tool?.name === "search_docs")), "agent framework routing should preload framework MCP tools");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "mcp_context_loaded" && event?.resources?.some((resource) => resource?.server === "docs" && resource?.uri === "docs://routing-guide")), "agent framework routing should preload framework MCP resources");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.capabilityRouting?.selected?.frameworks?.some((framework) => framework?.name === "research-stack"), "agent framework selection should be recorded in capabilityRouting");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.capabilityRouting?.selected?.mcpTools?.some((tool) => tool?.server === "docs" && tool?.name === "search_docs"), "agent framework MCP tool selection should be recorded in capabilityRouting");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.capabilityRouting?.selected?.mcpResources?.some((resource) => resource?.server === "docs" && resource?.uri === "docs://routing-guide"), "agent framework MCP resource selection should be recorded in capabilityRouting");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.activeAgentFrameworks?.some((framework) => framework?.name === "research-stack"), "agent framework routing should record active frameworks in the result");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.activeAgentFrameworks?.some((framework) => framework?.name === "research-stack" && framework?.mcpResources?.includes("docs://routing-guide")), "agent framework routing should record active framework MCP resources in the result");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.activeAgentFrameworks?.some((framework) => framework?.name === "research-stack" && framework?.agentRoles?.some((item) => item.includes("reviewer:")) && framework?.handoffs?.some((item) => item.includes("orchestrator -> reviewer"))), "agent framework routing should record active framework execution blueprint");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "auto_continue" && event?.reason === "framework_blueprint_guard" && event?.frameworkBlueprintGuard?.missingAgent === "reviewer" && event?.autoDelegated === true), "framework blueprint guard should auto-continue and mark automatic delegation when final response skips required agent_run handoff");
+  assert(agentFrameworkRoutingCompleted?.events?.some((event) => event?.type === "tool_start" && event?.tool === "agent_run" && event?.automatic === true && event?.arguments?.agentName === "reviewer"), "framework blueprint guard should start the missing agent_run automatically");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.frameworkBlueprintGuards?.some((guard) => guard?.framework?.name === "research-stack" && guard?.missingAgent === "reviewer"), "framework blueprint guard metadata should be recorded in the result");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.toolResults?.some((result) => result?.name === "agent_run" && result?.data?.agentName === "reviewer" && String(result?.data?.finalText || "").includes("framework reviewer confirmed")), "framework blueprint guard should force the missing reviewer agent_run before completion");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("## Routing Evidence"), "agent framework routing memory suggestion should include routing evidence");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("research-stack"), "agent framework routing memory suggestion should preserve the selected framework");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("Framework blueprints"), "agent framework routing memory suggestion should preserve framework blueprint section");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("orchestrator -> reviewer"), "agent framework routing memory suggestion should preserve framework handoff evidence");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("docs://routing-guide"), "agent framework routing memory suggestion should preserve the selected MCP resource");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.evidence?.frameworkCount >= 1, "agent framework routing memory suggestion should count selected frameworks");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.evidence?.frameworkBlueprintCount >= 1, "agent framework routing memory suggestion should count framework blueprint evidence");
+  assert(agentFrameworkRoutingCompleted?.data?.result?.memoryMaintenance?.suggestion?.evidence?.mcpResourceCount >= 1, "agent framework routing memory suggestion should count selected MCP resources");
+  assert((await readTextEventually(path.join(workspace, "auto", "framework-routing-output.txt"))).includes("framework skill memory agent mcp resource"), "agent framework routing smoke should write output after framework contexts are injected");
+
+  const pluginCapabilityRoutingStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli plugin capability routing smoke prompt",
+      messages: [{ role: "user", content: "plugin capability routing smoke: use route-pack plugin-route-helper skill, plugin-route-flow command, and plugin-explorer agent." }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(pluginCapabilityRoutingStarted.response.status === 202, "plugin capability routing smoke session should start");
+  const pluginCapabilityRoutingCompleted = await waitForSessionDone(pluginCapabilityRoutingStarted.payload?.data?.id);
+  assert(pluginCapabilityRoutingCompleted?.data?.status === "completed", "plugin capability routing smoke session should complete");
+  assert(pluginCapabilityRoutingCompleted?.data?.result?.finalText?.includes("plugin capability routing smoke completed"), "plugin capability routing smoke should reach final response");
+  assert(pluginCapabilityRoutingCompleted?.events?.some((event) => event?.type === "skill_loaded" && event?.autoRouted === true && event?.skill?.name === "plugin-route-helper" && event?.skill?.source === "plugin"), "auto capability routing should auto-load matching plugin skills");
+  assert(pluginCapabilityRoutingCompleted?.events?.some((event) => event?.type === "command_loaded" && event?.autoRouted === true && event?.command?.name === "plugin-route-flow" && event?.command?.source === "plugin"), "auto capability routing should auto-load matching plugin commands");
+  assert(pluginCapabilityRoutingCompleted?.events?.some((event) => event?.type === "agent_loaded" && event?.autoRouted === true && event?.agent?.name === "plugin-explorer" && event?.agent?.source === "plugin"), "auto capability routing should auto-load matching plugin agents");
+  assert(pluginCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.selected?.skills?.some((skill) => skill?.name === "plugin-route-helper" && skill?.plugin === "route-pack"), "plugin skill selection should be recorded in capabilityRouting");
+  assert(pluginCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.selected?.commands?.some((command) => command?.name === "plugin-route-flow" && command?.plugin === "route-pack"), "plugin command selection should be recorded in capabilityRouting");
+  assert(pluginCapabilityRoutingCompleted?.data?.result?.capabilityRouting?.selected?.agents?.some((agent) => agent?.name === "plugin-explorer" && agent?.plugin === "route-pack"), "plugin agent selection should be recorded in capabilityRouting");
+  assert((await readTextEventually(path.join(workspace, "auto", "plugin-routing-output.txt"))).includes("plugin skill command agent"), "plugin capability routing smoke should write output after plugin routed contexts are injected");
+
   const skillGuidedStarted = await request("/agent/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2758,6 +4835,7 @@ try {
       messages: [{ role: "user", content: "skill guided smoke" }],
       maxTurns: 8,
       maxAutoContinuations: 1,
+      disableCapabilityRouting: true,
     }),
   });
   assert(skillGuidedStarted.response.status === 202, "skill guided smoke session should start");
@@ -2780,6 +4858,7 @@ try {
       messages: [{ role: "user", content: "command guided smoke" }],
       maxTurns: 8,
       maxAutoContinuations: 1,
+      disableCapabilityRouting: true,
     }),
   });
   assert(commandGuidedStarted.response.status === 202, "command guided smoke session should start");
@@ -2830,6 +4909,7 @@ try {
       messages: [{ role: "user", content: "output style guided smoke" }],
       maxTurns: 8,
       maxAutoContinuations: 1,
+      disableCapabilityRouting: true,
     }),
   });
   assert(outputStyleGuidedStarted.response.status === 202, "output style guided smoke session should start");
@@ -2873,6 +4953,7 @@ try {
       messages: [{ role: "user", content: "memory guided smoke" }],
       maxTurns: 6,
       maxAutoContinuations: 1,
+      disableCapabilityRouting: true,
     }),
   });
   assert(memoryGuidedStarted.response.status === 202, "memory guided smoke session should start");
@@ -3054,6 +5135,125 @@ try {
     body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: {} }, null, 2) }),
   });
 
+  const autoMemorySuggestionStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli auto memory suggestion smoke prompt",
+      messages: [{ role: "user", content: "auto memory suggestion smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(autoMemorySuggestionStarted.response.status === 202, "auto memory suggestion smoke session should start");
+  const autoMemorySuggestionCompleted = await waitForSessionDone(autoMemorySuggestionStarted.payload?.data?.id);
+  assert(autoMemorySuggestionCompleted?.data?.status === "completed", "auto memory suggestion smoke session should complete");
+  assert(autoMemorySuggestionCompleted?.data?.result?.finalText?.includes("auto memory suggestion smoke completed"), "auto memory suggestion smoke should reach final response");
+  assert(autoMemorySuggestionCompleted?.events?.some((event) => event?.type === "memory_update_suggested" && event?.autoWrite === false), "ocli should emit a memory_update_suggested event by default");
+  assert(autoMemorySuggestionCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("memory/auto-memory-suggestion-output.txt"), "ocli should include generated artifact paths in memory update suggestions");
+  assert(autoMemorySuggestionCompleted?.data?.result?.memoryMaintenance?.suggestion?.content?.includes("## Continuation State"), "ocli memory suggestions should include continuation state");
+  assert(autoMemorySuggestionCompleted?.data?.result?.memoryMaintenance?.suggestion?.evidence?.stoppedReason === "completed", "ocli memory suggestions should record completed stoppedReason");
+  assert(!autoMemorySuggestionCompleted?.events?.some((event) => event?.type === "memory_auto_written"), "ocli should not auto-write memory unless explicitly enabled");
+
+  const autoMemoryOpenTodoStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli auto memory open todo smoke prompt",
+      messages: [{ role: "user", content: "auto memory open todo smoke" }],
+      maxTurns: 3,
+      maxAutoContinuations: 0,
+    }),
+  });
+  assert(autoMemoryOpenTodoStarted.response.status === 202, "auto memory open todo smoke session should start");
+  const autoMemoryOpenTodoCompleted = await waitForSessionDone(autoMemoryOpenTodoStarted.payload?.data?.id);
+  const openTodoSuggestion = autoMemoryOpenTodoCompleted?.data?.result?.memoryMaintenance?.suggestion || {};
+  assert(autoMemoryOpenTodoCompleted?.data?.status === "completed", "auto memory open todo smoke session should complete");
+  assert(autoMemoryOpenTodoCompleted?.data?.result?.stoppedReason === "max_turns", "ocli should not mark a session completed when open todos remain at the turn limit");
+  assert(openTodoSuggestion?.evidence?.openTodoCount === 1, "ocli memory suggestions should count open todos");
+  assert(openTodoSuggestion?.evidence?.stoppedReason === "max_turns", "ocli memory suggestions should record max_turns stoppedReason");
+  assert(String(openTodoSuggestion?.content || "").includes("## Open Todo Evidence"), "ocli memory suggestions should include open todo evidence");
+  assert(String(openTodoSuggestion?.content || "").includes("open-memory-follow-up"), "ocli memory suggestions should preserve unfinished todo text");
+  const continuationHealth = await request("/health");
+  assert(Number(continuationHealth.payload?.continuationPendingCount || 0) >= 1, "health summary should expose sessions needing continuation");
+  assert(continuationHealth.payload?.latestSession?.needsContinuation === true && continuationHealth.payload?.latestSession?.stoppedReason === "max_turns", "health summary latest session should expose max-turn continuation state");
+  const continuationList = await request("/agent/sessions");
+  const listedContinuationSession = continuationList.payload?.data?.sessions?.find((session) => session?.id === autoMemoryOpenTodoStarted.payload?.data?.id);
+  assert(listedContinuationSession?.needsContinuation === true && listedContinuationSession?.stoppedReason === "max_turns", "session list should expose sessions needing continuation");
+
+  const autoMemoryCleanRequestStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli auto memory clean request smoke prompt",
+      messages: [
+        { role: "user", content: "auto memory clean request smoke" },
+        {
+          role: "user",
+          content: [
+            "已发现以下 MCP 能力。这里只是能力清单，不代表已经调用工具或读取资源；需要使用时必须显式调用 mcp_call。",
+            '<mcp_context>{"tools":[{"server":"docs","name":"search_docs"}]}</mcp_context>',
+          ].join("\n"),
+        },
+      ],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(autoMemoryCleanRequestStarted.response.status === 202, "auto memory clean request smoke session should start");
+  const autoMemoryCleanRequestCompleted = await waitForSessionDone(autoMemoryCleanRequestStarted.payload?.data?.id);
+  assert(autoMemoryCleanRequestCompleted?.data?.status === "completed", "auto memory clean request smoke session should complete");
+  assert(autoMemoryCleanRequestCompleted?.data?.result?.finalText?.includes("auto memory clean request smoke completed"), "auto memory clean request smoke should reach final response");
+  const cleanSuggestion = autoMemoryCleanRequestCompleted?.data?.result?.memoryMaintenance?.suggestion || {};
+  const cleanRequestSection = String(cleanSuggestion.content || "").match(/## User Request\n([\s\S]*?)\n\n## Outcome/)?.[1] || "";
+  assert(String(cleanSuggestion.title || "").includes("auto memory clean request smoke"), "memory suggestion title should use the real user request instead of injected context");
+  assert(cleanRequestSection.includes("auto memory clean request smoke"), "memory suggestion should preserve the real user request");
+  assert(!cleanRequestSection.includes("<mcp_context") && !cleanRequestSection.includes("已发现以下 MCP 能力"), "memory suggestion user request should omit injected MCP context");
+
+  const autoMemorySettingsWrite = await request("/tools/settings_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ settings: { memory: { autoWrite: true, scope: "project" }, permissions: {} } }),
+  });
+  assert(autoMemorySettingsWrite.payload?.ok === true, "settings_write should allow local memory settings");
+  const autoMemorySettingsRead = await request("/tools/settings_read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json" }),
+  });
+  assert(autoMemorySettingsRead.payload?.data?.safeValues?.memory?.autoWrite === true, "settings_read should expose safe memory.autoWrite state");
+  const autoMemoryWriteStarted = await request("/agent/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      apiBaseUrl: fakeApiBaseUrl,
+      model: "deepseek-v4-pro",
+      systemPrompt: "ocli auto memory write smoke prompt",
+      messages: [{ role: "user", content: "auto memory write smoke" }],
+      maxTurns: 4,
+      maxAutoContinuations: 1,
+    }),
+  });
+  assert(autoMemoryWriteStarted.response.status === 202, "auto memory write smoke session should start");
+  const autoMemoryWriteCompleted = await waitForSessionDone(autoMemoryWriteStarted.payload?.data?.id);
+  assert(autoMemoryWriteCompleted?.data?.status === "completed", "auto memory write smoke session should complete");
+  assert(autoMemoryWriteCompleted?.data?.result?.finalText?.includes("auto memory write smoke completed"), "auto memory write smoke should reach final response");
+  const autoWrittenPath = autoMemoryWriteCompleted?.data?.result?.memoryMaintenance?.written?.path;
+  assert(typeof autoWrittenPath === "string" && autoWrittenPath.startsWith(".oases/memory/project/ocli-"), "ocli should auto-write memory when local memory.autoWrite is enabled");
+  assert(autoMemoryWriteCompleted?.events?.some((event) => event?.type === "memory_auto_written" && event?.path === autoWrittenPath), "ocli should emit memory_auto_written after local autoWrite");
+  assert((await readTextEventually(path.join(workspace, autoWrittenPath))).includes("memory/auto-memory-write-output.txt"), "auto-written memory should include generated artifact paths");
+  await request("/tools/write_file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: ".oases/settings.local.json", content: JSON.stringify({ permissions: {} }, null, 2) }),
+  });
+
   const crawlerArtifactStarted = await request("/agent/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3070,7 +5270,7 @@ try {
   const crawlerArtifactSessionId = crawlerArtifactStarted.payload?.data?.id;
   const crawlerArtifactCompleted = await waitForSessionDone(crawlerArtifactSessionId);
   assert(crawlerArtifactCompleted?.data?.status === "completed", "crawler artifact smoke session should complete");
-  assert(crawlerArtifactCompleted?.data?.result?.finalText?.includes("crawler artifact smoke completed"), "crawler artifact smoke should reach final response");
+  assert(crawlerArtifactCompleted?.data?.result?.finalText?.includes("crawler artifact smoke completed"), `crawler artifact smoke should reach final response: ${JSON.stringify({ data: crawlerArtifactCompleted?.data || {}, events: crawlerArtifactCompleted?.events || [] }, null, 2)}`);
   assert(crawlerArtifactCompleted?.data?.result?.toolResults?.some((result) => result?.name === "todo_write"), "crawler artifact smoke should use todo_write");
   assert(crawlerArtifactCompleted?.data?.result?.toolResults?.some((result) => result?.name === "fetch_url"), "crawler artifact smoke should fetch a source URL");
   assert(crawlerArtifactCompleted?.data?.result?.toolResults?.some((result) => result?.artifacts?.some((artifact) => artifact?.path === "crawler/oilprice_crawler.py")), "crawler artifact smoke should preserve crawler code artifact");
@@ -3093,6 +5293,18 @@ try {
   assert(persistedCrawlerDetail.payload?.todos?.some((todo) => todo?.text === "Write crawler code"), "persisted session detail should expose latest todo snapshot");
   assert(typeof persistedCrawlerDetail.payload?.resumePrompt === "string" && persistedCrawlerDetail.payload.resumePrompt.includes("crawler/oilprice_crawler.py"), "persisted session detail should include a resume prompt with artifacts");
   assert(persistedCrawlerDetail.payload?.approvalSummary?.required === 0, "persisted session detail should include approval summary");
+  const crawlerTodoClear = await request("/tools/todo_write", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      todos: [
+        { text: "Fetch source page", status: "done" },
+        { text: "Write crawler code", status: "done" },
+        { text: "Export dataset", status: "done" },
+      ],
+    }),
+  });
+  assert(crawlerTodoClear.payload?.ok === true, "crawler artifact smoke should clear open todos before later independent sessions");
 
   const upstreamErrorStarted = await request("/agent/sessions", {
     method: "POST",
@@ -3141,7 +5353,7 @@ try {
   assert(longStarted.response.status === 202, "long max turn smoke session should start");
   const longCompleted = await waitForSessionDone(longStarted.payload?.data?.id);
   assert(longCompleted?.data?.result?.stoppedReason === "completed", "agent should honor web-provided maxTurns above the old 12-turn cap");
-  assert(longCompleted?.data?.result?.finalText?.includes("long max turn smoke completed"), "long max turn smoke should reach the final model response");
+  assert(longCompleted?.data?.result?.finalText?.includes("long max turn smoke completed"), `long max turn smoke should reach the final model response: ${JSON.stringify({ data: longCompleted?.data || {}, events: longCompleted?.events || [] }, null, 2)}`);
 
   console.log("ocli smoke passed");
 } finally {

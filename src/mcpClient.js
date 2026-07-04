@@ -6,6 +6,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { VERSION } from "./constants.js";
 
 const activeServers = new Map();
 const TIMEOUT_MS = 30_000;
@@ -131,7 +132,7 @@ async function ensureInitialized(name, config) {
       await sendRequest(entry, "initialize", {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {}, resources: {} },
-        clientInfo: { name: "ocli", version: "0.1.19" },
+        clientInfo: { name: "ocli", version: VERSION },
       });
       sendNotification(entry, "notifications/initialized");
       const toolsResult = await sendRequest(entry, "tools/list").catch(() => ({ tools: [] }));

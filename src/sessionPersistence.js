@@ -8,7 +8,29 @@ function sessionDirectory(root, sessionId) {
   return path.join(root, SESSION_ROOT, sessionId);
 }
 
+function countPendingApprovals(session) {
+  return session?.pendingApprovals instanceof Map
+    ? [...session.pendingApprovals.values()].filter((approval) => !approval?.status || approval.status === "pending").length
+    : 0;
+}
+
+function continuationSummary(session) {
+  const result = session?.result && typeof session.result === "object" ? session.result : {};
+  const stoppedReason = typeof result.stoppedReason === "string" && result.stoppedReason
+    ? result.stoppedReason
+    : session?.status === "failed" ? "failed" : "";
+  const openTodoCount = Array.isArray(result.openTodos) ? result.openTodos.length : 0;
+  return {
+    stoppedReason,
+    needsContinuation: session?.status === "failed" || (
+      session?.status === "completed" && ((stoppedReason && stoppedReason !== "completed") || openTodoCount > 0)
+    ),
+  };
+}
+
 function publicSessionMetadata(session) {
+  const pendingApprovalCount = countPendingApprovals(session);
+  const continuation = continuationSummary(session);
   return {
     id: session.id,
     status: session.status,
@@ -16,6 +38,11 @@ function publicSessionMetadata(session) {
     updatedAt: session.updatedAt,
     model: session.model,
     apiBaseUrl: session.apiBaseUrl,
+    resumedFromSessionId: session.resumedFromSessionId || undefined,
+    pendingApprovalCount,
+    waitingForApproval: pendingApprovalCount > 0,
+    ...(continuation.stoppedReason ? { stoppedReason: continuation.stoppedReason } : {}),
+    needsContinuation: continuation.needsContinuation,
     eventCount: session.events.length,
     result: session.result,
     error: session.error || undefined,
@@ -96,6 +123,14 @@ export async function readPersistedSessionDetail(root, sessionId) {
     },
     events,
   };
+}
+
+export async function readPersistedSessionRequest(root, sessionId) {
+  const directory = sessionDirectory(root, sessionId);
+  const raw = await readFile(path.join(directory, "request.json"), "utf8");
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Persisted session request is invalid.");
+  return parsed;
 }
 
 export { SESSION_ROOT };

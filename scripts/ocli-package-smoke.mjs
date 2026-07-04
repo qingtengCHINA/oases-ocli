@@ -139,6 +139,37 @@ if (!outsideRejected) throw new Error('installed package memory_read should reje
 let nestedRejected = false;
 try { await handleTool(process.cwd(), 'memory_write', { scope: 'team', path: '.oases/memory/team/nested/release.md', title: 'Nested', content: 'nested' }); } catch { nestedRejected = true; }
 if (!nestedRejected) throw new Error('installed package memory_write should reject nested memory paths');
+const agentWritten = await handleTool(process.cwd(), 'agent_write', {
+  name: 'release-reviewer',
+  title: 'Release Reviewer',
+  description: 'Verify release readiness',
+  agentType: 'verify',
+  maxTurns: 4,
+  effort: 'low',
+  tools: ['read_file', 'grep_files', 'workspace_status'],
+  disallowedTools: 'delete_file',
+  skills: 'web-search',
+  memories: ['team:release-policy'],
+  initialPrompt: 'package agent initial marker\\nsecond package line',
+  prompt: 'Review release artifacts and report concrete blocking risks.\\n\\npackage agent prompt marker',
+});
+if (!agentWritten.written || agentWritten.path !== '.oases/agents/release-reviewer.md') throw new Error('installed package could not write structured custom agent');
+if (agentWritten.artifacts?.[0]?.role !== 'agent_file') throw new Error('installed package agent_write did not return agent artifact');
+if (agentWritten.agent?.agentType !== 'verify' || agentWritten.agent?.effort !== 'low') throw new Error('installed package agent_write did not parse agent metadata');
+const agentListed = await handleTool(process.cwd(), 'agent_list', { maxResults: 10 });
+if (!agentListed.agents?.some((agent) => agent.name === 'release-reviewer' && agent.tools?.includes('workspace_status') && agent.disallowedTools?.includes('delete_file'))) throw new Error('installed package could not list agent_write metadata');
+const agentRead = await handleTool(process.cwd(), 'agent_read', { name: 'release-reviewer' });
+if (!String(agentRead.prompt || '').includes('package agent prompt marker')) throw new Error('installed package could not read agent_write prompt');
+if (!String(agentRead.agent?.initialPrompt || '').includes('second package line')) throw new Error('installed package agent_read did not parse block initialPrompt');
+let duplicateAgentRejected = false;
+try { await handleTool(process.cwd(), 'agent_write', { name: 'release-reviewer', prompt: 'duplicate' }); } catch { duplicateAgentRejected = true; }
+if (!duplicateAgentRejected) throw new Error('installed package agent_write should reject overwrite by default');
+let outsideAgentRejected = false;
+try { await handleTool(process.cwd(), 'agent_write', { path: '../bad-agent.md', prompt: 'outside' }); } catch { outsideAgentRejected = true; }
+if (!outsideAgentRejected) throw new Error('installed package agent_write should reject paths outside .oases/agents');
+let unknownAgentToolRejected = false;
+try { await handleTool(process.cwd(), 'agent_write', { name: 'bad-tool-agent', tools: ['not_a_tool'], prompt: 'bad tool' }); } catch { unknownAgentToolRejected = true; }
+if (!unknownAgentToolRejected) throw new Error('installed package agent_write should reject unknown tool names');
 `,
   ], installRoot);
   await run(process.execPath, [
